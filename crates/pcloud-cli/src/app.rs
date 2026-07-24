@@ -1,5 +1,6 @@
-// **PLATFORM:** Linux
-// **GATING:** none (portable; uses Linux-only idioms — see TODO(bd-xplat)).
+// **PLATFORM:** all supported daemon platforms.
+// **GATING:** platform-specific IPC and process handling live below shared
+// pcloud-ipc/pcloud-supervisor abstractions.
 
 use crate::commands::{Command, SecretInputs};
 use crate::prompt::{PromptError, SecretPrompt, prompt_line};
@@ -20,8 +21,8 @@ pub fn help_text() -> &'static str {
         "\n",
         "NAME\n",
         "    pcloudc — command-line client that talks to a running pcloudd daemon\n",
-        // TODO(bd-xplat): Linux-only — needs cfg gate or platform trait abstraction. See PLAN_CROSSPLATFORM.md §2.
-        "    over a 0600-protected Unix socket (`SO_PEERCRED` authenticated).\n",
+        "    over authenticated local IPC: an owner-only, peer-credentialed\n",
+        "    Unix socket or a SID-restricted Windows named pipe.\n",
         "    Each invocation is a one-shot RPC: it connects, sends one request,\n",
         "    prints the reply, exits. State lives in the daemon — never in the\n",
         "    CLI process.\n",
@@ -101,6 +102,22 @@ pub fn help_text() -> &'static str {
         "                           counters. Returns zeros when idle.\n",
         "\n",
         "────────────────────────────────────────────────────────────────\n",
+        "REMOTE FILES\n",
+        "────────────────────────────────────────────────────────────────\n",
+        "    ls [REMOTE]            List direct children (default: /).\n",
+        "    get REMOTE [LOCAL]     Stream a remote file to a crash-safe local\n",
+        "                           temporary, then publish it atomically.\n",
+        "                           Use --force to replace an existing target.\n",
+        "    put LOCAL REMOTE       Stream a local file in bounded chunks.\n",
+        "    cp FROM TO             Copy a remote file or folder tree.\n",
+        "    mv FROM TO             Rename or move a remote entry.\n",
+        "    rm REMOTE [-r]         Delete a file or an empty folder; -r permits\n",
+        "                           recursive folder deletion.\n",
+        "    mkdir REMOTE           Create one remote folder.\n",
+        "    cat REMOTE             Stream raw remote bytes to stdout.\n",
+        "                           Remote paths must be absolute (/...).\n",
+        "\n",
+        "────────────────────────────────────────────────────────────────\n",
         "AUTHENTICATION\n",
         "────────────────────────────────────────────────────────────────\n",
         "    login [LOGIN-OPTIONS]  Interactive mini-REPL that chains prompts:\n",
@@ -157,14 +174,14 @@ pub fn help_text() -> &'static str {
         "                           Best for piped-credential helpers.\n",
         "      --password-env <VAR> Read the password from environment variable\n",
         "                           <VAR>, then immediately `unsetenv(VAR)` so\n",
-        // TODO(bd-xplat): Linux-only — needs cfg gate or platform trait abstraction. See PLAN_CROSSPLATFORM.md §2.
-        "                           /proc/<pid>/environ stops exposing it.\n",
-        // M-8.4: surface /proc/self/cmdline leak warning in help text for --allow-argv-password.
+        "                           the process environment. The value can be\n",
+        "                           observable briefly to same-user process\n",
+        "                           inspection; stdin is preferable.\n",
         "      --allow-argv-password Acknowledge the security risk of passing a\n",
         "                           password as a command-line argument. The\n",
-        "                           password is visible to all processes on the\n",
-        "                           host via /proc/self/cmdline (Linux) and\n",
-        "                           shell history. Accepted ONLY for backward-\n",
+        "                           password can be visible through process\n",
+        "                           inspection tools and shell history on every\n",
+        "                           supported OS. Accepted ONLY for backward-\n",
         "                           compatibility with scripts that cannot use\n",
         "                           --password-stdin or --password-env. Prefer\n",
         "                           those flags in all production deployments.\n",
@@ -308,12 +325,12 @@ pub fn help_text() -> &'static str {
         "    change-link-upload <ID> <POL>     Upload policy on the link.\n",
         "    create-upload-link ...            Create an upload-only link.\n",
         "    delete-upload-link <ID>           Delete an upload-only link.\n",
-        "    create-tree-link <PATHS...>       Selective tree link (mixed files).\n",
-        "    create-tree-link-from-paths <NAME> <PCLOUD-PATH>...\n",
+        "    create-tree-link <FOLDER-IDS...>  Selective tree link (folder ids only).\n",
+        "    create-tree-link-from-paths <NAME> [--root PATH] [--folder PATH] [--file PATH]...\n",
         "                                      Create a tree public link by resolving\n",
-        "                                      one or more absolute pCloud-drive paths\n",
-        "                                      to ids on the daemon (authenticated path\n",
-        "                                      resolver). At least one path required.\n",
+        "                                      absolute pCloud-drive root/folder/file\n",
+        "                                      paths to ids on the daemon. Bare paths\n",
+        "                                      are accepted as folders for compatibility.\n",
         "    list-link-access <ID>             List upload-link access grants.\n",
         "    add-link-access / remove-link-access <ID> <EMAIL>\n",
         "                                      Manage upload-link access list.\n",
@@ -509,6 +526,12 @@ fn flag_takes_value(token: &str) -> bool {
             | "--zstd-level"
             | "--type"
             | "--max"
+            | "--parent"
+            | "--parent-folder-id"
+            | "--size"
+            | "--total-bytes"
+            | "--conflict"
+            | "--conflict-mode"
             | "--backend"
             | "--hint"
     )
@@ -584,11 +607,27 @@ pub fn normalize_args(args: &[String]) -> Result<(Command, Vec<String>), Command
             "conflicts" | "conflict" => (Command::ConflictList, 2),
             "suggest" => (Command::SyncSuggest, 2),
             "is-syncable" | "syncable" => (Command::SyncIsSyncable, 2),
+            // T1.1 selective sync: `sync exclude <add|remove|list> <sync-id> [pattern]`.
+            "exclude" | "excl" => match commandish.get(2).map(|(_, s)| s.as_str()) {
+                Some("add") => (Command::SyncExcludeAdd, 3),
+                Some("remove" | "rm") => (Command::SyncExcludeRemove, 3),
+                Some("list" | "ls") => (Command::SyncExcludeList, 3),
+                Some(other) => {
+                    return Err(CommandParseError::UnknownCommand(format!(
+                        "sync exclude {other}"
+                    )));
+                }
+                None => {
+                    return Err(CommandParseError::UnknownCommand(
+                        "sync exclude (missing subcommand: add|remove|list)".to_owned(),
+                    ));
+                }
+            },
             other => return Err(CommandParseError::UnknownCommand(format!("sync {other}"))),
         },
         (Some("sync" | "s"), None) => {
             return Err(CommandParseError::UnknownCommand(
-                "sync (missing subcommand: list|add|remove|change-type|pause|resume|localscan|suggest|is-syncable)"
+                "sync (missing subcommand: list|add|remove|change-type|exclude|pause|resume|localscan|suggest|is-syncable)"
                     .to_owned(),
             ));
         }
@@ -1008,6 +1047,14 @@ fn allowed_flags_for(command: &Command) -> &'static [&'static str] {
         // `SecretInputs::sync_type` and threaded into
         // `Request::SyncRootAdd.sync_type`.
         Command::SyncAdd => &["--type"],
+        Command::UploadCreate => &[
+            "--parent",
+            "--parent-folder-id",
+            "--size",
+            "--total-bytes",
+            "--conflict",
+            "--conflict-mode",
+        ],
         // `publink send <code> --to <emails> [--message <text>]`
         // mirrors C `psync_send_publink`.
         Command::SendPublink => &["--to", "--message"],
@@ -1031,6 +1078,8 @@ fn allowed_flags_for(command: &Command) -> &'static [&'static str] {
         // `migrate-from-c [--dry-run] [--force-overwrite] [--from <dir>]`
         // — flags consumed CLI-side by `main::run_migrate_from_c`.
         Command::MigrateFromC { .. } => &["--dry-run", "--force-overwrite", "--from"],
+        // `doctor --strict` promotes advisory warnings to failures.
+        Command::Doctor => &["--strict"],
         // `verify <path> [--recursive] [--fix] [--yes]` — R9 #12.
         // `--json` is consumed globally so it does not appear here.
         Command::Verify { .. } => &["--recursive", "--fix", "--yes"],
@@ -1053,15 +1102,13 @@ fn allowed_flags_for(command: &Command) -> &'static [&'static str] {
         Command::SnapshotPrune | Command::BackupSnapshotPrune => {
             &["--retention-days", "--yes", "--gpg-recipient"]
         }
-        // `log <PATH> [--limit N] [--json]` — R9 #9 revision history.
-        // `--json` is a global flag stripped earlier by `GlobalFlags`.
-        Command::FileHistory => &["--limit"],
-        // `diff` / `restore` are CLI-side stubs; flags are rejected.
-        Command::FileDiff | Command::FileRestore => &[],
+        // `change-link-password <ID> [PASSWORD|clear]` — password on argv
+        // requires the explicit argv-secret gate acknowledgement.
+        Command::ChangeLinkPassword => &["--allow-argv-password"],
         // `sync suggest [<PATH>] [--max N]` — suggest sync folders.
         Command::SyncSuggest => &["--max"],
         // `account register <EMAIL> [--accept-terms]` — terms acceptance.
-        Command::AccountRegister => &["--accept-terms"],
+        Command::AccountRegister => &["--accept-terms", "--allow-argv-password"],
         // `account change-password` reads old + new via interactive prompt.
         // `--password-stdin` / `--password-env` are accepted as secure
         // sources to match the `submit-password` convention.
@@ -1073,11 +1120,18 @@ fn allowed_flags_for(command: &Command) -> &'static [&'static str] {
         Command::AccountVerifyEmailRestricted => &[],
         // `account lost-password <EMAIL>` — positional only.
         Command::AccountLostPassword => &[],
+        // `create-tree-link-from-paths <NAME> [--root PATH] [--folder PATH] [--file PATH]`.
+        Command::CreateTreeLinkFromPaths => &["--root", "--folder", "--file"],
         // `crypto change-password` / `crypto change-password-unlocked`
         // — old + new password via secure prompts; hint + code positionals.
-        Command::CryptoChangePassword | Command::CryptoChangePasswordUnlocked => {
-            &["--password-stdin", "--password-env"]
-        }
+        // `--allow-argv-password` is accepted (with a visible warning) for
+        // scripted callers that cannot use stdin/env. Must be consistent with
+        // the gate check in `parse_inputs_for_command`.
+        Command::CryptoChangePassword | Command::CryptoChangePasswordUnlocked => &[
+            "--password-stdin",
+            "--password-env",
+            "--allow-argv-password",
+        ],
         // `crypto setup [--backend <name>] [--acknowledge-not-interop]
         // [--hint <TEXT>]` — dual-backend setup selector. Backend and hint
         // take values; `--acknowledge-not-interop` is a standalone gate.
@@ -1090,6 +1144,19 @@ fn allowed_flags_for(command: &Command) -> &'static [&'static str] {
             "--password-stdin",
             "--password-env",
         ],
+        // T1.3 — `conflict resolve <PATH> <POLICY-FLAG>`. Plan-mandated
+        // short aliases plus the engine's canonical long forms.
+        Command::ConflictResolve => &[
+            "--keep-local",
+            "--keep-remote",
+            "--keep-both",
+            "--prefer-local",
+            "--prefer-remote",
+            "--newest-wins",
+            "--rename-both",
+        ],
+        Command::RemoteGet => &["--force"],
+        Command::RemoteRm => &["--recursive", "-r"],
         // Everything else takes positionals only. Note that `-` alone
         // (often meaning stdin) is handled as a positional by
         // `reject_unknown_subcommand_flags` and never fails this check.
@@ -1112,6 +1179,9 @@ fn command_display(command: &Command) -> &'static str {
         Command::SyncAdd => "sync add",
         Command::SyncRemove => "sync remove",
         Command::SyncChangeType => "sync change-type",
+        Command::SyncExcludeAdd => "sync exclude add",
+        Command::SyncExcludeRemove => "sync exclude remove",
+        Command::SyncExcludeList => "sync exclude list",
         Command::SyncList => "sync list",
         Command::SyncStatus => "sync status",
         Command::RunLocalScan => "sync localscan",
@@ -1123,6 +1193,14 @@ fn command_display(command: &Command) -> &'static str {
         Command::GetFolderOwnerId => "folder owner",
         Command::FilesystemStatus => "fs status",
         Command::Stat => "stat",
+        Command::RemoteLs => "ls",
+        Command::RemoteGet => "get",
+        Command::RemotePut => "put",
+        Command::RemoteCp => "cp",
+        Command::RemoteMv => "mv",
+        Command::RemoteRm => "rm",
+        Command::RemoteMkdir => "mkdir",
+        Command::RemoteCat => "cat",
         Command::SubmitCryptoPassword => "crypto start",
         Command::LockCrypto => "crypto stop",
         Command::CryptoStatus => "crypto status",
@@ -1269,6 +1347,9 @@ fn canonical_token_for(command: &Command) -> String {
         Command::SyncAdd => "sync-add",
         Command::SyncRemove => "sync-remove",
         Command::SyncChangeType => "sync-change-type",
+        Command::SyncExcludeAdd => "sync-exclude-add",
+        Command::SyncExcludeRemove => "sync-exclude-remove",
+        Command::SyncExcludeList => "sync-exclude-list",
         Command::UserInfo => "userinfo",
         Command::Pause => "pause",
         Command::Resume => "resume",
@@ -1315,12 +1396,17 @@ fn canonical_token_for(command: &Command) -> String {
         Command::GetFolderOwnerId => "folder-owner",
         Command::FilesystemStatus => "fs-status",
         Command::Stat => "stat",
+        Command::RemoteLs => "ls",
+        Command::RemoteGet => "get",
+        Command::RemotePut => "put",
+        Command::RemoteCp => "cp",
+        Command::RemoteMv => "mv",
+        Command::RemoteRm => "rm",
+        Command::RemoteMkdir => "mkdir",
+        Command::RemoteCat => "cat",
         Command::Doctor => "doctor",
         Command::MigrateFromC { .. } => "migrate-from-c",
         Command::Verify { .. } => "verify",
-        Command::FileHistory => "log",
-        Command::FileDiff => "diff",
-        Command::FileRestore => "restore",
         Command::SnapshotCreate => "snapshot-create",
         Command::SnapshotRestore => "snapshot-restore",
         Command::SnapshotVerify => "snapshot-verify",
@@ -1416,6 +1502,9 @@ fn parse_single_token(token: &str) -> Result<Command, CommandParseError> {
         "sync-add" => Command::SyncAdd,
         "sync-remove" => Command::SyncRemove,
         "sync-change-type" | "sync-set-type" | "sync-retype" => Command::SyncChangeType,
+        "sync-exclude-add" => Command::SyncExcludeAdd,
+        "sync-exclude-remove" => Command::SyncExcludeRemove,
+        "sync-exclude-list" => Command::SyncExcludeList,
         "userinfo" => Command::UserInfo,
         "pause" => Command::Pause,
         "resume" => Command::Resume,
@@ -1468,6 +1557,14 @@ fn parse_single_token(token: &str) -> Result<Command, CommandParseError> {
         "folder-owner" | "get-folder-owner" => Command::GetFolderOwnerId,
         "fs-status" | "filesystem-status" => Command::FilesystemStatus,
         "stat" | "stat-path" => Command::Stat,
+        "ls" | "remote-ls" => Command::RemoteLs,
+        "get" | "remote-get" => Command::RemoteGet,
+        "put" | "remote-put" => Command::RemotePut,
+        "cp" | "remote-cp" => Command::RemoteCp,
+        "mv" | "remote-mv" => Command::RemoteMv,
+        "rm" | "remote-rm" => Command::RemoteRm,
+        "mkdir" | "remote-mkdir" => Command::RemoteMkdir,
+        "cat" | "remote-cat" => Command::RemoteCat,
         "doctor" | "self-check" | "selfcheck" => Command::Doctor,
         // `migrate-from-c` is CLI-side only. Flag/value parsing
         // (`--dry-run`, `--force-overwrite`, `--from <path>`) happens
@@ -1478,16 +1575,6 @@ fn parse_single_token(token: &str) -> Result<Command, CommandParseError> {
             force_overwrite: false,
             from: None,
         },
-        // `log` / `file-log` — git-log-style revision history (R9 #9).
-        // Positional path and `--limit` flag are resolved by
-        // `parse_inputs_for_command`. Honest scope: the daemon
-        // currently returns Unavailable until bd-1du.10 clears the
-        // public-API gate.
-        "log" | "file-log" | "file-history" => Command::FileHistory,
-        // `diff` / `restore` — placeholder stubs for the revision
-        // follow-up. Always exit Unavailable for now.
-        "diff" | "file-diff" => Command::FileDiff,
-        "restore" | "file-restore" => Command::FileRestore,
         // `verify` walks a local path and cross-checks SHA256 against
         // the server-reported digest. R9 enhancement #12. Positional
         // path and boolean flags are resolved by
@@ -1600,6 +1687,24 @@ pub fn parse_inputs(args: &[String]) -> Result<SecretInputs, ParseInputsError> {
     Ok(inputs)
 }
 
+fn remote_positionals(args: &[String]) -> Vec<String> {
+    args.iter()
+        .skip(2)
+        .filter(|arg| arg.as_str() == "-" || !arg.starts_with('-'))
+        .cloned()
+        .collect()
+}
+
+fn require_absolute_remote(operation: &str, path: &str) -> Result<(), PromptError> {
+    if path.starts_with('/') {
+        Ok(())
+    } else {
+        Err(invalid_input_owned(format!(
+            "{operation}: remote path must be absolute and start with '/': {path:?}"
+        )))
+    }
+}
+
 pub fn parse_inputs_for_command(
     command: &Command,
     args: &[String],
@@ -1689,23 +1794,51 @@ pub fn parse_inputs_for_command(
             }))
         }
         Command::SubmitCryptoPassword => {
-            let crypto_password = match args.get(2) {
-                Some(password) => {
-                    // Hard failure unless the caller explicitly acknowledged the risk.
-                    if !args.iter().any(|a| a == "--allow-argv-password") {
-                        eprintln!(
-                            "Error: Passing secrets as command-line arguments leaks them via \
-                             /proc/*/cmdline and shell history. Use --allow-argv-password to override."
-                        );
-                        std::process::exit(2);
+            let crypto_password = if args.iter().any(|a| a == "--password-stdin") {
+                use std::io::BufRead;
+                let stdin = std::io::stdin();
+                let mut line = String::new();
+                stdin.lock().read_line(&mut line)?;
+                if line.ends_with('\n') {
+                    line.pop();
+                    if line.ends_with('\r') {
+                        line.pop();
                     }
-                    eprintln!(
-                        "warning: passing a crypto password on the command line is insecure \
-                         (visible via /proc/<pid>/cmdline). --allow-argv-password acknowledged."
-                    );
-                    password.clone()
                 }
-                None => SecretPrompt::new("Crypto password").read_secret()?,
+                line
+            } else if let Some(var) = args
+                .iter()
+                .position(|a| a == "--password-env")
+                .and_then(|idx| args.get(idx + 1))
+                .filter(|s| !s.starts_with("--"))
+            {
+                let value = std::env::var(var).map_err(|_| {
+                    PromptError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("--password-env: environment variable '{var}' is not set"),
+                    ))
+                })?;
+                unsafe { std::env::remove_var(var) };
+                value
+            } else {
+                match args.get(2).filter(|s| !s.starts_with("--")) {
+                    Some(password) => {
+                        // Hard failure unless the caller explicitly acknowledged the risk.
+                        if !args.iter().any(|a| a == "--allow-argv-password") {
+                            eprintln!(
+                                "Error: Passing secrets as command-line arguments leaks them via \
+                                 /proc/*/cmdline and shell history. Use --allow-argv-password to override."
+                            );
+                            std::process::exit(2);
+                        }
+                        eprintln!(
+                            "warning: passing a crypto password on the command line is insecure \
+                             (visible via /proc/<pid>/cmdline). --allow-argv-password acknowledged."
+                        );
+                        password.clone()
+                    }
+                    None => SecretPrompt::new("Crypto password").read_secret()?,
+                }
             };
             Ok(build_inputs(trust_device, recovery_code, |inputs| {
                 inputs.crypto_password = SecretString::new(crypto_password);
@@ -1783,6 +1916,89 @@ pub fn parse_inputs_for_command(
             };
             Ok(build_inputs(trust_device, recovery_code, |inputs| {
                 inputs.sync_id = sync_id;
+            }))
+        }
+        // T1.1 selective sync. By the time we reach this parser, the
+        // `sync exclude <action>` triple has already been collapsed to
+        // a single canonical token, so positionals start at args[2]:
+        // <sync-id> then <pattern>. Pattern is required for add/remove,
+        // ignored for list.
+        Command::SyncExcludeAdd | Command::SyncExcludeRemove => {
+            let sync_id: u64 = match args.get(2) {
+                Some(id) => id
+                    .parse()
+                    .map_err(|_| invalid_input("sync id must be numeric"))?,
+                None => prompt_line("Sync ID")?
+                    .parse()
+                    .map_err(|_| invalid_input("sync id must be numeric"))?,
+            };
+            let pattern = match args.get(3) {
+                Some(raw) => raw.clone(),
+                None => prompt_line("Glob pattern (e.g. *.tmp, build/**)")?,
+            };
+            if pattern.trim().is_empty() {
+                return Err(invalid_input("exclude pattern must not be empty"));
+            }
+            Ok(build_inputs(trust_device, recovery_code, |inputs| {
+                inputs.sync_id = sync_id;
+                inputs.sync_exclude_pattern = pattern;
+            }))
+        }
+        Command::SyncExcludeList => {
+            let sync_id: u64 = match args.get(2) {
+                Some(id) => id
+                    .parse()
+                    .map_err(|_| invalid_input("sync id must be numeric"))?,
+                None => prompt_line("Sync ID")?
+                    .parse()
+                    .map_err(|_| invalid_input("sync id must be numeric"))?,
+            };
+            Ok(build_inputs(trust_device, recovery_code, |inputs| {
+                inputs.sync_id = sync_id;
+            }))
+        }
+        // T1.3 — `conflict resolve <path> [--policy]`. After
+        // normalization the canonical-token form is
+        // `[program, conflict-resolve, <path>, <policy-or-flag>]`.
+        // Accepts both `--keep-local|--keep-remote|--keep-both`
+        // (T1.3 plan-mandated short aliases) and the legacy long
+        // forms `--prefer-local|--prefer-remote|--newest-wins|
+        // --rename-both`. The flag is converted to the engine's
+        // canonical policy string here so the daemon stays a thin
+        // pass-through.
+        Command::ConflictResolve => {
+            let path = match args.get(2) {
+                Some(raw) if !raw.starts_with("--") => raw.clone(),
+                _ => prompt_line("Conflict path")?,
+            };
+            if path.trim().is_empty() {
+                return Err(invalid_input("conflict path must not be empty"));
+            }
+            // Find the policy flag anywhere on the command line so
+            // operators can write either order. The first match wins.
+            let mut policy: Option<&'static str> = None;
+            for raw in args.iter() {
+                let mapped = match raw.as_str() {
+                    "--keep-local" | "--prefer-local" => Some("prefer_local"),
+                    "--keep-remote" | "--prefer-remote" => Some("prefer_remote"),
+                    "--keep-both" | "--rename-both" => Some("rename_both"),
+                    "--newest-wins" => Some("newest_wins"),
+                    _ => None,
+                };
+                if let Some(p) = mapped {
+                    policy = Some(p);
+                    break;
+                }
+            }
+            let policy = policy.ok_or_else(|| {
+                invalid_input(
+                    "conflict resolve requires --keep-local | --keep-remote | --keep-both \
+                     (aliases: --prefer-local, --prefer-remote, --rename-both, --newest-wins)",
+                )
+            })?;
+            Ok(build_inputs(trust_device, recovery_code, |inputs| {
+                inputs.conflict_path = path;
+                inputs.conflict_resolve_policy = policy.to_owned();
             }))
         }
         Command::ShowLink => {
@@ -1863,7 +2079,22 @@ pub fn parse_inputs_for_command(
             };
             let public_link_password: Option<SecretString> = match args.get(3) {
                 Some(value) if value.eq_ignore_ascii_case("clear") => None,
-                Some(value) => Some(SecretString::new(value.clone())),
+                Some(value) => {
+                    // Security: argv passwords are visible in /proc/*/cmdline
+                    // and shell history. Require explicit acknowledgement.
+                    if !args.iter().any(|a| a == "--allow-argv-password") {
+                        eprintln!(
+                            "Error: Passing passwords as command-line arguments leaks them via \
+                             /proc/*/cmdline and shell history. Use --allow-argv-password to override."
+                        );
+                        std::process::exit(2);
+                    }
+                    eprintln!(
+                        "warning: passing a link password on the command line is insecure \
+                         (visible via /proc/<pid>/cmdline). --allow-argv-password acknowledged."
+                    );
+                    Some(SecretString::new(value.clone()))
+                }
                 None => {
                     let value = SecretPrompt::new("New password or 'clear'").read_secret()?;
                     if value.eq_ignore_ascii_case("clear") {
@@ -2370,63 +2601,6 @@ pub fn parse_inputs_for_command(
                 inputs.folder_metadata_remote_path = path;
             }))
         }
-        Command::FileHistory => {
-            // `pcloud-rs log <PATH> [--limit N]` — R9 #9 revision history.
-            // Honest scope: the daemon currently returns Unavailable
-            // until bd-1du.10 clears the public-API gate.
-            let path = match args.get(2) {
-                Some(value) => value.clone(),
-                None => {
-                    return Err(invalid_input(
-                        "log: remote pCloud-drive path is required (e.g. /Docs/report.txt)",
-                    ));
-                }
-            };
-            let limit = match parse_flag_string(raw_args, "--limit")? {
-                Some(raw) => Some(
-                    raw.parse::<u32>()
-                        .map_err(|_| invalid_input("--limit must be a non-negative integer"))?,
-                ),
-                None => None,
-            };
-            Ok(build_inputs(trust_device, recovery_code, |inputs| {
-                inputs.file_history_path = path;
-                inputs.file_history_limit = limit;
-            }))
-        }
-        Command::FileDiff => {
-            let path = match args.get(2) {
-                Some(value) => value.clone(),
-                None => return Err(invalid_input("diff: <PATH> <REV_A> <REV_B> are required")),
-            };
-            let rev_a = match args.get(3) {
-                Some(value) => value.clone(),
-                None => return Err(invalid_input("diff: <REV_A> is required")),
-            };
-            let rev_b = match args.get(4) {
-                Some(value) => value.clone(),
-                None => return Err(invalid_input("diff: <REV_B> is required")),
-            };
-            Ok(build_inputs(trust_device, recovery_code, |inputs| {
-                inputs.file_history_path = path;
-                inputs.file_diff_rev_a = rev_a;
-                inputs.file_diff_rev_b = rev_b;
-            }))
-        }
-        Command::FileRestore => {
-            let path = match args.get(2) {
-                Some(value) => value.clone(),
-                None => return Err(invalid_input("restore: <PATH> <REV> are required")),
-            };
-            let rev = match args.get(3) {
-                Some(value) => value.clone(),
-                None => return Err(invalid_input("restore: <REV> is required")),
-            };
-            Ok(build_inputs(trust_device, recovery_code, |inputs| {
-                inputs.file_history_path = path;
-                inputs.file_restore_rev = rev;
-            }))
-        }
         Command::FilesystemStatus => {
             // `pcloud-rs fs status <absolute-local-path>`. Mirrors C
             // `psync_filesystem_status` (`pclsync/psynclib.c:1903`).
@@ -2445,7 +2619,8 @@ pub fn parse_inputs_for_command(
         Command::Stat => {
             // `pcloudc stat <absolute-remote-path>`. Mirrors C
             // `psync_stat_path` (`pclsync/psynclib.h:743`).
-            let path = match args.get(1) {
+            // args[0] = binary name, args[1] = "stat", args[2] = path.
+            let path = match args.get(2) {
                 Some(value) => value.clone(),
                 None => {
                     return Err(invalid_input(
@@ -2455,6 +2630,109 @@ pub fn parse_inputs_for_command(
             };
             Ok(build_inputs(trust_device, recovery_code, |inputs| {
                 inputs.stat_remote_path = path;
+            }))
+        }
+        Command::RemoteLs => {
+            let path = args.get(2).cloned().unwrap_or_else(|| "/".to_owned());
+            require_absolute_remote("ls", &path)?;
+            Ok(build_inputs(trust_device, recovery_code, |inputs| {
+                inputs.remote_fs_source = path;
+            }))
+        }
+        Command::RemoteGet => {
+            let positionals = remote_positionals(args);
+            let remote = positionals
+                .first()
+                .cloned()
+                .ok_or_else(|| invalid_input("get: <REMOTE_PATH> is required"))?;
+            require_absolute_remote("get", &remote)?;
+            let local = positionals.get(1).map_or_else(
+                || {
+                    std::path::PathBuf::from(
+                        remote
+                            .rsplit('/')
+                            .find(|part| !part.is_empty())
+                            .unwrap_or("download"),
+                    )
+                },
+                std::path::PathBuf::from,
+            );
+            let overwrite = args.iter().any(|arg| arg == "--force");
+            Ok(build_inputs(trust_device, recovery_code, |inputs| {
+                inputs.remote_fs_source = remote;
+                inputs.remote_fs_local_path = local;
+                inputs.remote_fs_overwrite = overwrite;
+            }))
+        }
+        Command::RemotePut => {
+            let positionals = remote_positionals(args);
+            let local = positionals
+                .first()
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| invalid_input("put: <LOCAL_PATH> is required"))?;
+            let remote = positionals
+                .get(1)
+                .cloned()
+                .ok_or_else(|| invalid_input("put: <REMOTE_PATH> is required"))?;
+            require_absolute_remote("put", &remote)?;
+            Ok(build_inputs(trust_device, recovery_code, |inputs| {
+                inputs.remote_fs_local_path = local;
+                inputs.remote_fs_destination = remote;
+            }))
+        }
+        Command::RemoteCp | Command::RemoteMv => {
+            let positionals = remote_positionals(args);
+            let operation = if matches!(command, Command::RemoteCp) {
+                "cp"
+            } else {
+                "mv"
+            };
+            let from = positionals
+                .first()
+                .cloned()
+                .ok_or_else(|| invalid_input_owned(format!("{operation}: <FROM> is required")))?;
+            let to = positionals
+                .get(1)
+                .cloned()
+                .ok_or_else(|| invalid_input_owned(format!("{operation}: <TO> is required")))?;
+            require_absolute_remote(operation, &from)?;
+            require_absolute_remote(operation, &to)?;
+            Ok(build_inputs(trust_device, recovery_code, |inputs| {
+                inputs.remote_fs_source = from;
+                inputs.remote_fs_destination = to;
+            }))
+        }
+        Command::RemoteRm => {
+            let positionals = remote_positionals(args);
+            let path = positionals
+                .first()
+                .cloned()
+                .ok_or_else(|| invalid_input("rm: <REMOTE_PATH> is required"))?;
+            require_absolute_remote("rm", &path)?;
+            let recursive = args.iter().any(|arg| arg == "--recursive" || arg == "-r");
+            Ok(build_inputs(trust_device, recovery_code, |inputs| {
+                inputs.remote_fs_source = path;
+                inputs.remote_fs_recursive = recursive;
+            }))
+        }
+        Command::RemoteMkdir => {
+            let path = args
+                .get(2)
+                .cloned()
+                .ok_or_else(|| invalid_input("mkdir: <REMOTE_PATH> is required"))?;
+            require_absolute_remote("mkdir", &path)?;
+            Ok(build_inputs(trust_device, recovery_code, |inputs| {
+                inputs.remote_fs_destination = path;
+            }))
+        }
+        Command::RemoteCat => {
+            let path = args
+                .get(2)
+                .cloned()
+                .ok_or_else(|| invalid_input("cat: <REMOTE_PATH> is required"))?;
+            require_absolute_remote("cat", &path)?;
+            Ok(build_inputs(trust_device, recovery_code, |inputs| {
+                inputs.remote_fs_source = path;
             }))
         }
         Command::SnapshotCreate
@@ -2610,11 +2888,25 @@ pub fn parse_inputs_for_command(
         }
         // ── Crypto change-password (Group A) ─────────────────────────────
         Command::CryptoChangePassword => {
-            // `crypto change-password <HINT> <CODE> [--max-flags N]`
-            // Old password: uses `crypto_password` (SecretString) via prompt.
-            // New password: uses `new_crypto_password` via prompt.
+            // `crypto change-password [OLD_PW] [NEW_PW] [HINT] [CODE]`
+            // Passphrases from argv are treated as secrets; require
+            // --allow-argv-password if either is supplied on argv.
             let old_password = match args.get(2) {
-                Some(pw) => pw.clone(),
+                Some(pw) => {
+                    if !args.iter().any(|a| a == "--allow-argv-password") {
+                        eprintln!(
+                            "Error: Passing crypto passphrases as command-line arguments leaks \
+                             them via /proc/*/cmdline and shell history. Use \
+                             --allow-argv-password to override."
+                        );
+                        std::process::exit(2);
+                    }
+                    eprintln!(
+                        "warning: passing a crypto passphrase on the command line is insecure \
+                         (visible via /proc/<pid>/cmdline). --allow-argv-password acknowledged."
+                    );
+                    pw.clone()
+                }
                 None => SecretPrompt::new("Current crypto passphrase").read_secret()?,
             };
             let new_password = match args.get(3) {
@@ -2631,9 +2923,25 @@ pub fn parse_inputs_for_command(
             }))
         }
         Command::CryptoChangePasswordUnlocked => {
-            // `crypto change-password-unlocked <HINT> <CODE>` — no old password needed.
+            // `crypto change-password-unlocked [NEW_PW] [HINT] [CODE]`
+            // No old password needed but the new passphrase on argv still
+            // requires --allow-argv-password.
             let new_password = match args.get(2) {
-                Some(pw) => pw.clone(),
+                Some(pw) => {
+                    if !args.iter().any(|a| a == "--allow-argv-password") {
+                        eprintln!(
+                            "Error: Passing crypto passphrases as command-line arguments leaks \
+                             them via /proc/*/cmdline and shell history. Use \
+                             --allow-argv-password to override."
+                        );
+                        std::process::exit(2);
+                    }
+                    eprintln!(
+                        "warning: passing a crypto passphrase on the command line is insecure \
+                         (visible via /proc/<pid>/cmdline). --allow-argv-password acknowledged."
+                    );
+                    pw.clone()
+                }
                 None => SecretPrompt::new("New crypto passphrase").read_secret()?,
             };
             let hint = args.get(3).cloned().unwrap_or_default();
@@ -2762,10 +3070,68 @@ pub fn parse_inputs_for_command(
                 inputs.download_local_path = local_path;
             }))
         }
+        Command::UploadCreate => {
+            let local_path = args
+                .get(2)
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| invalid_input("upload create: <LOCAL_PATH> is required"))?;
+            let remote_name = args
+                .get(3)
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                .ok_or_else(|| invalid_input("upload create: <REMOTE_NAME> is required"))?;
+            let parent_raw = parse_flag_string(raw_args, "--parent")?
+                .or(parse_flag_string(raw_args, "--parent-folder-id")?);
+            let parent_folder_id = parent_raw
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| invalid_input("upload parent folder id must be numeric"))
+                })
+                .transpose()?;
+            let total_raw = parse_flag_string(raw_args, "--size")?
+                .or(parse_flag_string(raw_args, "--total-bytes")?);
+            let total_bytes = total_raw
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| invalid_input("upload total bytes must be numeric"))
+                })
+                .transpose()?
+                .unwrap_or(0);
+            let conflict_raw = parse_flag_string(raw_args, "--conflict")?
+                .or(parse_flag_string(raw_args, "--conflict-mode")?);
+            let conflict_mode = match conflict_raw.as_deref().unwrap_or("error") {
+                "error" => pcloud_ipc::UploadConflictMode::Error,
+                "overwrite" | "replace" => pcloud_ipc::UploadConflictMode::Overwrite,
+                "skip" => pcloud_ipc::UploadConflictMode::Skip,
+                "rename" => pcloud_ipc::UploadConflictMode::Rename,
+                _ => {
+                    return Err(invalid_input(
+                        "upload conflict mode must be error|overwrite|skip|rename",
+                    ));
+                }
+            };
+            Ok(build_inputs(trust_device, recovery_code, |inputs| {
+                inputs.upload_local_path = local_path;
+                inputs.upload_remote_name = remote_name;
+                inputs.upload_parent_folder_id = parent_folder_id;
+                inputs.upload_total_bytes = total_bytes;
+                inputs.upload_conflict_mode = Some(conflict_mode);
+            }))
+        }
+        Command::UploadPause | Command::UploadResume | Command::UploadCancel => {
+            let session_id = parse_u64_arg(args.get(2), "upload session id")?;
+            Ok(build_inputs(trust_device, recovery_code, |inputs| {
+                inputs.upload_session_id = session_id;
+            }))
+        }
         // ── Upload server-side copy (audit-06 H-4.2 + bd-1du row 93) ─────
         Command::UploadWriteFromFile => {
             // `upload write-from-file <UPLOAD_ID> <SOURCE_FILEID>
-            // <SOURCE_HASH> <OFFSET> <COUNT>`
+            // <SOURCE_HASH> <UPLOAD_OFFSET> <SOURCE_OFFSET> <COUNT>`.
+            // The historical five-argument shape is still accepted as
+            // `SOURCE_OFFSET = UPLOAD_OFFSET`.
             let upload_id: u64 = args
                 .get(2)
                 .ok_or_else(|| invalid_input("upload write-from-file: <UPLOAD_ID> required"))?
@@ -2783,12 +3149,24 @@ pub fn parse_inputs_for_command(
                 .map_err(|_| invalid_input("source_hash must be numeric"))?;
             let offset: u64 = args
                 .get(5)
-                .ok_or_else(|| invalid_input("upload write-from-file: <OFFSET> required"))?
+                .ok_or_else(|| invalid_input("upload write-from-file: <UPLOAD_OFFSET> required"))?
                 .parse::<u64>()
-                .map_err(|_| invalid_input("offset must be numeric"))?;
-            let count: u64 = args
-                .get(6)
-                .ok_or_else(|| invalid_input("upload write-from-file: <COUNT> required"))?
+                .map_err(|_| invalid_input("upload_offset must be numeric"))?;
+            let (source_offset, count_arg) = match (args.get(6), args.get(7)) {
+                (Some(source_offset), Some(count)) => {
+                    let parsed_source_offset = source_offset
+                        .parse::<u64>()
+                        .map_err(|_| invalid_input("source_offset must be numeric"))?;
+                    (parsed_source_offset, count)
+                }
+                (Some(count), None) => (offset, count),
+                (None, _) => {
+                    return Err(invalid_input(
+                        "upload write-from-file: <SOURCE_OFFSET> and <COUNT> required",
+                    ));
+                }
+            };
+            let count: u64 = count_arg
                 .parse::<u64>()
                 .map_err(|_| invalid_input("count must be numeric"))?;
             Ok(build_inputs(trust_device, recovery_code, |inputs| {
@@ -2796,6 +3174,7 @@ pub fn parse_inputs_for_command(
                 inputs.upload_write_from_file_source_fileid = source_fileid;
                 inputs.upload_write_from_file_source_hash = source_hash;
                 inputs.upload_write_from_file_offset = offset;
+                inputs.upload_write_from_file_source_offset = source_offset;
                 inputs.upload_write_from_file_count = count;
             }))
         }
@@ -2857,7 +3236,8 @@ pub fn parse_inputs_for_command(
         Command::BackupDeleteDevice => Ok(build_inputs(trust_device, recovery_code, |_| {})),
         // ── Create tree link from paths ───────────────────────────────────
         Command::CreateTreeLinkFromPaths => {
-            // `create-tree-link-from-paths <NAME> <PATH>...`
+            // `create-tree-link-from-paths <NAME> [--root PATH] [--folder PATH] [--file PATH]...`
+            // Bare paths remain folder targets for compatibility.
             // NAME is not a secret; use arg_or_prompt (plain echo).
             let name = match args.get(2) {
                 Some(v) => v.clone(),
@@ -2867,17 +3247,47 @@ pub fn parse_inputs_for_command(
                     ));
                 }
             };
-            // args[3..] are pCloud-drive paths resolved daemon-side via
-            // the authenticated path resolver (Request::CreateTreePublicLinkFromPaths).
-            let paths: Vec<String> = args.get(3..).map(<[String]>::to_vec).unwrap_or_default();
-            if paths.is_empty() {
+            let mut root: Option<String> = None;
+            let mut folders: Vec<String> = Vec::new();
+            let mut files: Vec<String> = Vec::new();
+            let mut idx = 3;
+            while let Some(token) = args.get(idx) {
+                match token.as_str() {
+                    "--root" => {
+                        idx += 1;
+                        let value = args.get(idx).ok_or_else(|| {
+                            invalid_input("create-tree-link-from-paths: --root requires a path")
+                        })?;
+                        root = Some(value.clone());
+                    }
+                    "--folder" => {
+                        idx += 1;
+                        let value = args.get(idx).ok_or_else(|| {
+                            invalid_input("create-tree-link-from-paths: --folder requires a path")
+                        })?;
+                        folders.push(value.clone());
+                    }
+                    "--file" => {
+                        idx += 1;
+                        let value = args.get(idx).ok_or_else(|| {
+                            invalid_input("create-tree-link-from-paths: --file requires a path")
+                        })?;
+                        files.push(value.clone());
+                    }
+                    bare => folders.push(bare.to_owned()),
+                }
+                idx += 1;
+            }
+            if root.is_none() && folders.is_empty() && files.is_empty() {
                 return Err(invalid_input(
-                    "create-tree-link-from-paths: at least one pCloud-drive path is required",
+                    "create-tree-link-from-paths: at least one root, folder, or file path is required",
                 ));
             }
             Ok(build_inputs(trust_device, recovery_code, |inputs| {
                 inputs.tree_link_name = name;
-                inputs.tree_link_paths = paths;
+                inputs.tree_link_root = root;
+                inputs.tree_link_paths = folders;
+                inputs.tree_link_files = files;
             }))
         }
         Command::CryptoSetupV2 => {
@@ -3107,7 +3517,7 @@ fn parse_iso_date_to_unix(s: &str) -> Option<u64> {
     let doy =
         (153 * (if month > 2 { month - 3 } else { month + 9 }) as u64 + 2) / 5 + day as u64 - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    let days_since_epoch = era as i64 * 146097 + doe as i64 - 719468;
+    let days_since_epoch = era * 146097 + doe as i64 - 719468;
     if days_since_epoch < 0 {
         return None;
     }
@@ -3163,6 +3573,9 @@ fn parse_flag_string(args: &[String], flag: &str) -> Result<Option<String>, Prom
                 .next()
                 .ok_or_else(|| invalid_input("flag requires a value"))?;
             return Ok(Some(raw.clone()));
+        } else if let Some(rest) = tok.strip_prefix(&format!("{flag}=")) {
+            // Support `--flag=value` inline form in addition to `--flag value`.
+            return Ok(Some(rest.to_owned()));
         }
     }
     Ok(None)
@@ -3258,11 +3671,11 @@ fn build_inputs(
         folder_metadata_remote_path: String::new(),
         filesystem_status_local_path: String::new(),
         stat_remote_path: String::new(),
-        file_history_path: String::new(),
-        file_history_limit: None,
-        file_diff_rev_a: String::new(),
-        file_diff_rev_b: String::new(),
-        file_restore_rev: String::new(),
+        remote_fs_source: String::new(),
+        remote_fs_destination: String::new(),
+        remote_fs_local_path: std::path::PathBuf::new(),
+        remote_fs_overwrite: false,
+        remote_fs_recursive: false,
         verify_local_path: String::new(),
         verify_recursive: false,
         verify_fix: false,
@@ -3286,9 +3699,11 @@ fn build_inputs(
         upload_write_from_file_source_fileid: 0,
         upload_write_from_file_source_hash: 0,
         upload_write_from_file_offset: 0,
+        upload_write_from_file_source_offset: 0,
         upload_write_from_file_count: 0,
         conflict_path: String::new(),
         conflict_resolve_policy: String::new(),
+        sync_exclude_pattern: String::new(),
         new_crypto_password: SecretString::new(String::new()),
         crypto_change_hint: String::new(),
         crypto_change_code: String::new(),
@@ -3309,7 +3724,9 @@ fn build_inputs(
         backup_create_local_path: String::new(),
         backup_create_parent_folder_name: None,
         backup_device_folder_id: 0,
+        tree_link_root: None,
         tree_link_paths: Vec::new(),
+        tree_link_files: Vec::new(),
         crypto_setup_backend: pcloud_ipc::methods::CryptoBackendIpc::PclsyncCompat,
         crypto_setup_acknowledge_not_interop: false,
         crypto_setup_hint: None,
@@ -3507,7 +3924,10 @@ mod tests {
     use crate::commands::Command;
     use pcloud_model::public_links::PublicLinkUploadPolicy;
 
-    use super::{CommandParseError, help_text, parse_command, parse_inputs_for_command};
+    use super::{
+        CommandParseError, canonical_token_for, command_display, help_text, parse_command,
+        parse_inputs_for_command,
+    };
 
     #[test]
     fn submit_password_uses_provided_args_without_defaults() {
@@ -3912,6 +4332,8 @@ mod tests {
             "change-link-password".to_owned(),
             "17".to_owned(),
             "new-secret".to_owned(),
+            // Argv password requires explicit acknowledgement.
+            "--allow-argv-password".to_owned(),
         ];
 
         let inputs = parse_inputs_for_command(&Command::ChangeLinkPassword, &args)
@@ -4574,6 +4996,122 @@ mod tests {
         );
     }
 
+    // T1.1.c.2 — selective-sync exclude commands.
+
+    #[test]
+    fn sync_exclude_add_three_token_form_parses() {
+        let args = argv(&["sync", "exclude", "add", "3", "*.tmp"]);
+        let cmd = parse_command(&args).unwrap();
+        assert_eq!(cmd, Command::SyncExcludeAdd);
+        let inputs = parse_inputs_for_command(&cmd, &args).expect("parse ok");
+        assert_eq!(inputs.sync_id, 3);
+        assert_eq!(inputs.sync_exclude_pattern, "*.tmp");
+    }
+
+    #[test]
+    fn sync_exclude_remove_short_alias_parses() {
+        let args = argv(&["sync", "excl", "rm", "5", "build/**"]);
+        let cmd = parse_command(&args).unwrap();
+        assert_eq!(cmd, Command::SyncExcludeRemove);
+        let inputs = parse_inputs_for_command(&cmd, &args).expect("parse ok");
+        assert_eq!(inputs.sync_id, 5);
+        assert_eq!(inputs.sync_exclude_pattern, "build/**");
+    }
+
+    #[test]
+    fn sync_exclude_list_canonical_token_parses() {
+        let args = argv(&["sync-exclude-list", "9"]);
+        let cmd = parse_command(&args).unwrap();
+        assert_eq!(cmd, Command::SyncExcludeList);
+        let inputs = parse_inputs_for_command(&cmd, &args).expect("parse ok");
+        assert_eq!(inputs.sync_id, 9);
+        assert!(inputs.sync_exclude_pattern.is_empty());
+    }
+
+    #[test]
+    fn sync_exclude_unknown_subcommand_errors() {
+        let args = argv(&["sync", "exclude", "wat", "1"]);
+        assert!(parse_command(&args).is_err());
+    }
+
+    #[test]
+    fn sync_exclude_missing_subcommand_errors() {
+        let args = argv(&["sync", "exclude"]);
+        assert!(parse_command(&args).is_err());
+    }
+
+    #[test]
+    fn sync_exclude_add_rejects_blank_pattern() {
+        let args = argv(&["sync", "exclude", "add", "1", "   "]);
+        let cmd = parse_command(&args).unwrap();
+        assert!(parse_inputs_for_command(&cmd, &args).is_err());
+    }
+
+    // T1.3 — conflict resolve flag parsing.
+
+    #[test]
+    fn conflict_resolve_keep_local_maps_to_prefer_local() {
+        let args = argv(&["conflict", "resolve", "docs/foo.txt", "--keep-local"]);
+        let cmd = parse_command(&args).unwrap();
+        assert_eq!(cmd, Command::ConflictResolve);
+        let inputs = parse_inputs_for_command(&cmd, &args).expect("parse ok");
+        assert_eq!(inputs.conflict_path, "docs/foo.txt");
+        assert_eq!(inputs.conflict_resolve_policy, "prefer_local");
+    }
+
+    #[test]
+    fn conflict_resolve_keep_remote_maps_to_prefer_remote() {
+        let args = argv(&["conflict", "resolve", "docs/bar.txt", "--keep-remote"]);
+        let cmd = parse_command(&args).unwrap();
+        let inputs = parse_inputs_for_command(&cmd, &args).expect("parse ok");
+        assert_eq!(inputs.conflict_resolve_policy, "prefer_remote");
+    }
+
+    #[test]
+    fn conflict_resolve_keep_both_maps_to_rename_both() {
+        let args = argv(&["conflict", "resolve", "docs/baz.txt", "--keep-both"]);
+        let cmd = parse_command(&args).unwrap();
+        let inputs = parse_inputs_for_command(&cmd, &args).expect("parse ok");
+        assert_eq!(inputs.conflict_resolve_policy, "rename_both");
+    }
+
+    #[test]
+    fn conflict_resolve_legacy_prefer_local_still_works() {
+        let args = argv(&["conflict", "resolve", "p", "--prefer-local"]);
+        let cmd = parse_command(&args).unwrap();
+        let inputs = parse_inputs_for_command(&cmd, &args).expect("parse ok");
+        assert_eq!(inputs.conflict_resolve_policy, "prefer_local");
+    }
+
+    #[test]
+    fn conflict_resolve_newest_wins_alias() {
+        let args = argv(&["conflict", "resolve", "p", "--newest-wins"]);
+        let cmd = parse_command(&args).unwrap();
+        let inputs = parse_inputs_for_command(&cmd, &args).expect("parse ok");
+        assert_eq!(inputs.conflict_resolve_policy, "newest_wins");
+    }
+
+    #[test]
+    fn conflict_resolve_missing_flag_errors() {
+        let args = argv(&["conflict", "resolve", "docs/foo.txt"]);
+        let cmd = parse_command(&args).unwrap();
+        assert!(parse_inputs_for_command(&cmd, &args).is_err());
+    }
+
+    #[test]
+    fn conflict_resolve_missing_path_errors_when_first_arg_is_flag() {
+        // First positional starts with `--` and there's no path → prompt
+        // path is required; non-interactive parse must fail.
+        // We can't simulate a TTY-less prompt, so omit the path entirely
+        // by giving only the flag — parse_inputs will try to prompt and
+        // fail on read; confirm that path is *not* sourced from the flag.
+        // Here we instead pass empty positional to confirm the
+        // empty-string guard fires.
+        let args = argv(&["conflict", "resolve", "   ", "--keep-local"]);
+        let cmd = parse_command(&args).unwrap();
+        assert!(parse_inputs_for_command(&cmd, &args).is_err());
+    }
+
     #[test]
     fn sync_change_type_rejects_non_numeric_id() {
         let args = argv(&["sync", "change-type", "NaN", "mirror"]);
@@ -4898,81 +5436,6 @@ mod tests {
         let cmd = parse_command(&argv(&["sync", "add", "-", "/b"]))
             .expect("bare `-` must pass through as positional");
         assert_eq!(cmd, Command::SyncAdd);
-    }
-
-    // R9 #9: `pcloudc log <PATH> [--limit N]` revision history. The
-    // positional path lives on `SecretInputs::file_history_path`; the
-    // Request::FileHistory variant carries it through to the daemon.
-    #[test]
-    fn log_parses_path_and_limit() {
-        let args = argv(&["log", "/Docs/report.txt", "--limit", "5"]);
-        let cmd = parse_command(&args).expect("log command parses");
-        assert_eq!(cmd, Command::FileHistory);
-        let inputs = parse_inputs_for_command(&cmd, &args).expect("log inputs parse");
-        assert_eq!(inputs.file_history_path, "/Docs/report.txt");
-        assert_eq!(inputs.file_history_limit, Some(5));
-
-        let req = cmd.into_request(&inputs);
-        match req {
-            pcloud_ipc::Request::FileHistory { path, limit } => {
-                assert_eq!(path, "/Docs/report.txt");
-                assert_eq!(limit, Some(5));
-            }
-            other => panic!("unexpected request: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn log_without_path_reports_usage_error() {
-        let args = argv(&["log"]);
-        let cmd = parse_command(&args).expect("log command parses without positional");
-        assert_eq!(cmd, Command::FileHistory);
-        let err = parse_inputs_for_command(&cmd, &args)
-            .expect_err("missing path must surface a usage error");
-        let message = format!("{err}");
-        assert!(
-            message.contains("remote pCloud-drive path"),
-            "error message must cite the required path: {message}"
-        );
-    }
-
-    #[test]
-    fn log_rejects_non_numeric_limit() {
-        let args = argv(&["log", "/x", "--limit", "not-a-number"]);
-        let cmd = parse_command(&args).expect("command parses");
-        let err =
-            parse_inputs_for_command(&cmd, &args).expect_err("non-numeric limit must be rejected");
-        let message = format!("{err}");
-        assert!(
-            message.contains("--limit"),
-            "error must cite the flag: {message}"
-        );
-    }
-
-    #[test]
-    fn diff_requires_three_positionals() {
-        let cmd = parse_command(&argv(&["diff"])).expect("diff parses without args");
-        assert_eq!(cmd, Command::FileDiff);
-        // Missing all positionals.
-        assert!(parse_inputs_for_command(&cmd, &argv(&["diff"])).is_err());
-        // Missing REV_B.
-        assert!(parse_inputs_for_command(&cmd, &argv(&["diff", "/x", "a"])).is_err());
-        // All present.
-        let inputs =
-            parse_inputs_for_command(&cmd, &argv(&["diff", "/x", "aa", "bb"])).expect("ok");
-        assert_eq!(inputs.file_history_path, "/x");
-        assert_eq!(inputs.file_diff_rev_a, "aa");
-        assert_eq!(inputs.file_diff_rev_b, "bb");
-    }
-
-    #[test]
-    fn restore_requires_path_and_rev() {
-        let cmd = parse_command(&argv(&["restore"])).expect("restore parses");
-        assert_eq!(cmd, Command::FileRestore);
-        assert!(parse_inputs_for_command(&cmd, &argv(&["restore", "/x"])).is_err());
-        let inputs = parse_inputs_for_command(&cmd, &argv(&["restore", "/x", "rev1"])).expect("ok");
-        assert_eq!(inputs.file_history_path, "/x");
-        assert_eq!(inputs.file_restore_rev, "rev1");
     }
 
     // ----- H12 PR1 — backup snapshot CLI surface tests -------------------
@@ -5365,6 +5828,505 @@ mod tests {
         match req {
             Request::CryptoGetFileKey { file_id } => assert_eq!(file_id, 5678),
             other => panic!("expected CryptoGetFileKey, got {other:?}"),
+        }
+    }
+
+    // ── Regression: 07-H-01 stat off-by-one ──────────────────────────────
+    // Prior to this fix `pcloudc stat /path` sent `"stat"` as the remote
+    // path because the parser read `args.get(1)` (the command token) instead
+    // of `args.get(2)` (the first positional argument).
+
+    #[test]
+    fn stat_parses_path_from_correct_position() {
+        use pcloud_ipc::Request;
+        let args = argv(&["stat", "/Documents/report.txt"]);
+        let cmd = parse_command(&args).expect("stat command must parse");
+        assert_eq!(cmd, Command::Stat);
+        let inputs = parse_inputs_for_command(&cmd, &args).expect("stat inputs must parse");
+        assert_eq!(
+            inputs.stat_remote_path, "/Documents/report.txt",
+            "stat_remote_path must be the user-supplied path, not the command name"
+        );
+        let req = cmd.into_request(&inputs);
+        match req {
+            Request::StatPath { path } => {
+                assert_eq!(path, "/Documents/report.txt");
+                assert_ne!(
+                    path, "stat",
+                    "stat must not forward the command token as the path"
+                );
+            }
+            other => panic!("expected StatPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stat_without_path_is_an_error() {
+        let args = argv(&["stat"]);
+        let cmd = parse_command(&args).expect("stat without path still parses the command");
+        assert_eq!(cmd, Command::Stat);
+        let err = parse_inputs_for_command(&cmd, &args)
+            .expect_err("stat without path must return an error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("absolute pCloud-drive path") || msg.contains("stat"),
+            "error must mention the required path argument: {msg}"
+        );
+    }
+
+    // ── Regression: 07-M-02 parse_flag_string inline `--flag=value` ──────
+    // `--flag value` and `--flag=value` must both be accepted.
+
+    #[test]
+    fn sync_suggest_max_accepts_inline_equals_form() {
+        let args = argv(&["sync", "suggest", "--max=10"]);
+        let cmd = parse_command(&args).expect("sync suggest must parse");
+        assert_eq!(cmd, Command::SyncSuggest);
+        let inputs =
+            parse_inputs_for_command(&cmd, &args).expect("sync suggest --max=10 must be accepted");
+        assert_eq!(
+            inputs.sync_suggest_max,
+            Some(10),
+            "--max=10 must be parsed as max=10, not silently ignored"
+        );
+    }
+
+    #[test]
+    fn sync_suggest_max_accepts_spaced_form() {
+        let args = argv(&["sync", "suggest", "--max", "5"]);
+        let cmd = parse_command(&args).expect("sync suggest must parse");
+        let inputs =
+            parse_inputs_for_command(&cmd, &args).expect("sync suggest --max 5 must be accepted");
+        assert_eq!(inputs.sync_suggest_max, Some(5));
+    }
+
+    #[test]
+    fn upload_write_from_file_parses_distinct_offsets() {
+        use pcloud_ipc::Request;
+
+        let args = argv(&[
+            "upload",
+            "write-from-file",
+            "77",
+            "88",
+            "99",
+            "4096",
+            "128",
+            "1024",
+        ]);
+        let cmd = parse_command(&args).expect("upload write-from-file must parse");
+        assert_eq!(cmd, Command::UploadWriteFromFile);
+
+        let inputs = parse_inputs_for_command(&cmd, &args)
+            .expect("upload write-from-file inputs must parse");
+        assert_eq!(inputs.upload_write_from_file_offset, 4096);
+        assert_eq!(inputs.upload_write_from_file_source_offset, 128);
+        assert_eq!(inputs.upload_write_from_file_count, 1024);
+
+        match cmd.into_request(&inputs) {
+            Request::UploadWriteFromFile {
+                offset,
+                source_offset,
+                count,
+                ..
+            } => {
+                assert_eq!(offset, 4096);
+                assert_eq!(source_offset, Some(128));
+                assert_eq!(count, 1024);
+            }
+            other => panic!("expected UploadWriteFromFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_tree_link_from_paths_accepts_root_folders_and_files() {
+        use pcloud_ipc::Request;
+
+        let args = argv(&[
+            "create-tree-link-from-paths",
+            "bundle",
+            "--root",
+            "/Projects",
+            "--folder",
+            "/Projects/docs",
+            "--file",
+            "/Projects/report.pdf",
+            "/Projects/legacy-folder",
+        ]);
+        let cmd = parse_command(&args).expect("create-tree-link-from-paths must parse");
+        assert_eq!(cmd, Command::CreateTreeLinkFromPaths);
+
+        let inputs =
+            parse_inputs_for_command(&cmd, &args).expect("tree path target inputs must parse");
+        assert_eq!(inputs.tree_link_root.as_deref(), Some("/Projects"));
+        assert_eq!(
+            inputs.tree_link_paths,
+            vec![
+                "/Projects/docs".to_owned(),
+                "/Projects/legacy-folder".to_owned()
+            ]
+        );
+        assert_eq!(
+            inputs.tree_link_files,
+            vec!["/Projects/report.pdf".to_owned()]
+        );
+
+        match cmd.into_request(&inputs) {
+            Request::CreateTreePublicLinkFromPathTargets {
+                root,
+                folders,
+                files,
+                ..
+            } => {
+                assert_eq!(root.as_deref(), Some("/Projects"));
+                assert_eq!(
+                    folders,
+                    vec![
+                        "/Projects/docs".to_owned(),
+                        "/Projects/legacy-folder".to_owned()
+                    ]
+                );
+                assert_eq!(files, vec!["/Projects/report.pdf".to_owned()]);
+            }
+            other => panic!("expected CreateTreePublicLinkFromPathTargets, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_command_family_parses_to_canonical_requests() {
+        use pcloud_ipc::Request;
+
+        let cases = [
+            (vec!["ls", "/Docs"], Command::RemoteLs),
+            (
+                vec!["get", "/Docs/a.txt", "a.txt", "--force"],
+                Command::RemoteGet,
+            ),
+            (vec!["put", "a.txt", "/Docs/a.txt"], Command::RemotePut),
+            (vec!["cp", "/Docs/a.txt", "/Docs/b.txt"], Command::RemoteCp),
+            (
+                vec!["mv", "/Docs/b.txt", "/Archive/b.txt"],
+                Command::RemoteMv,
+            ),
+            (vec!["rm", "/Archive", "--recursive"], Command::RemoteRm),
+            (vec!["mkdir", "/Docs/New"], Command::RemoteMkdir),
+            (vec!["cat", "/Docs/a.txt"], Command::RemoteCat),
+        ];
+        for (tokens, expected) in cases {
+            let args = argv(&tokens);
+            let command = parse_command(&args).unwrap();
+            assert_eq!(command, expected);
+            let inputs = parse_inputs_for_command(&command, &args).unwrap();
+            let request = command.into_request(&inputs);
+            assert!(
+                matches!(
+                    request,
+                    Request::ListFolderByPath { .. }
+                        | Request::DownloadFileByPath { .. }
+                        | Request::UploadFileByPath { .. }
+                        | Request::CopyPath { .. }
+                        | Request::RenamePath { .. }
+                        | Request::DeletePath { .. }
+                        | Request::CreateFolderByPath { .. }
+                        | Request::ReadFileRange { .. }
+                ),
+                "unexpected remote request: {request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_commands_reject_relative_remote_paths() {
+        for tokens in [
+            vec!["ls", "Docs"],
+            vec!["put", "a.txt", "Docs/a.txt"],
+            vec!["rm", "Docs/a.txt"],
+        ] {
+            let args = argv(&tokens);
+            let command = parse_command(&args).unwrap();
+            assert!(parse_inputs_for_command(&command, &args).is_err());
+        }
+    }
+
+    #[test]
+    fn every_specialized_command_has_a_human_display_label() {
+        let commands = [
+            Command::Status,
+            Command::LoginBegin,
+            Command::Mount,
+            Command::MountForceUnmount,
+            Command::Unmount,
+            Command::SyncAdd,
+            Command::SyncRemove,
+            Command::SyncChangeType,
+            Command::SyncExcludeAdd,
+            Command::SyncExcludeRemove,
+            Command::SyncExcludeList,
+            Command::SyncList,
+            Command::SyncStatus,
+            Command::RunLocalScan,
+            Command::SendPublink,
+            Command::AuditVerify,
+            Command::CreateRemoteFolder,
+            Command::GetFolderIdByPath,
+            Command::GetFolderFlags,
+            Command::GetFolderOwnerId,
+            Command::FilesystemStatus,
+            Command::Stat,
+            Command::RemoteLs,
+            Command::RemoteGet,
+            Command::RemotePut,
+            Command::RemoteCp,
+            Command::RemoteMv,
+            Command::RemoteRm,
+            Command::RemoteMkdir,
+            Command::RemoteCat,
+            Command::SubmitCryptoPassword,
+            Command::LockCrypto,
+            Command::CryptoStatus,
+            Command::SessionStatus,
+            Command::SubmitPassword,
+            Command::SubmitAuthToken,
+            Command::SubmitTwoFactorCode,
+            Command::SubmitRecoveryCode,
+            Command::ListNotifications,
+            Command::MarkNotificationsRead { upto_id: 1 },
+            Command::Verify {
+                path: std::path::PathBuf::from("/tmp"),
+                recursive: false,
+                fix: false,
+                yes: false,
+            },
+            Command::SnapshotCreate,
+            Command::SnapshotRestore,
+            Command::SnapshotVerify,
+            Command::SnapshotPrune,
+            Command::BackupSnapshotCreate,
+            Command::BackupSnapshotRestore,
+            Command::BackupSnapshotVerify,
+            Command::BackupSnapshotPrune,
+            Command::CryptoReset,
+            Command::CryptoPrivKeyFlags,
+            Command::CryptoSendChangePrivate,
+            Command::CryptoChangePassword,
+            Command::CryptoChangePasswordUnlocked,
+            Command::CryptoHint,
+            Command::CryptoSetupV2,
+            Command::CryptoGetFolderKey,
+            Command::CryptoGetFileKey,
+            Command::SyncSuggest,
+            Command::SyncIsSyncable,
+            Command::AccountVerifyEmail,
+            Command::AccountVerifyEmailRestricted,
+            Command::AccountLostPassword,
+            Command::AccountChangePassword,
+            Command::AccountRegister,
+            Command::AccountApiServers,
+            Command::AccountSetApiServer,
+            Command::AccountSetLanguage,
+            Command::AccountPromo,
+            Command::DownloadLink,
+            Command::DownloadFile,
+            Command::BackupDelete,
+            Command::BackupCreate,
+            Command::BackupStopDevice,
+            Command::BackupDeleteDevice,
+        ];
+        for command in commands {
+            assert!(
+                !command_display(&command).is_empty(),
+                "missing label for {command:?}"
+            );
+            if !matches!(
+                command,
+                Command::SubmitPassword
+                    | Command::SubmitAuthToken
+                    | Command::SubmitTwoFactorCode
+                    | Command::SubmitRecoveryCode
+                    | Command::SubmitCryptoPassword
+                    | Command::ChangeLinkPassword
+                    | Command::CryptoChangePassword
+                    | Command::CryptoChangePasswordUnlocked
+                    | Command::CryptoSetupV2
+                    | Command::AccountChangePassword
+                    | Command::AccountRegister
+            ) {
+                let args = vec!["pcloudc".to_owned(), canonical_token_for(&command)];
+                let _ = parse_inputs_for_command(&command, &args);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_command_families_aliases_and_diagnostics_all_normalize() {
+        let successful: &[&[&str]] = &[
+            &[],
+            &["sync", "list"],
+            &["s", "ls"],
+            &["sync", "status"],
+            &["s", "st"],
+            &["sync", "add"],
+            &["sync", "remove"],
+            &["s", "rm"],
+            &["sync", "change-type"],
+            &["sync", "set-type"],
+            &["sync", "retype"],
+            &["sync", "pause"],
+            &["sync", "resume"],
+            &["sync", "localscan"],
+            &["sync", "conflict"],
+            &["sync", "conflicts"],
+            &["sync", "suggest"],
+            &["sync", "syncable"],
+            &["sync", "is-syncable"],
+            &["sync", "exclude", "add"],
+            &["sync", "excl", "remove"],
+            &["sync", "exclude", "rm"],
+            &["sync", "excl", "list"],
+            &["sync", "exclude", "ls"],
+            &["conflict", "list"],
+            &["conflict", "ls"],
+            &["conflict", "resolve"],
+            &["publink", "send"],
+            &["folder", "create"],
+            &["folder", "id"],
+            &["folder", "flags"],
+            &["folder", "owner"],
+            &["fs", "status"],
+            &["crypto", "start"],
+            &["c", "stop"],
+            &["crypto", "status"],
+            &["c", "st"],
+            &["crypto", "reset"],
+            &["crypto", "privkeyflags"],
+            &["crypto", "priv-key-flags"],
+            &["crypto", "send-change"],
+            &["crypto", "send-change-private"],
+            &["crypto", "change-pass"],
+            &["crypto", "change-password"],
+            &["crypto", "change-pass-unlocked"],
+            &["crypto", "change-password-unlocked"],
+            &["crypto", "hint"],
+            &["crypto", "setup"],
+            &["crypto", "setup-v2"],
+            &["crypto", "folder-key"],
+            &["crypto", "get-folder-key"],
+            &["crypto", "file-key"],
+            &["crypto", "get-file-key"],
+            &["account", "verify-email"],
+            &["account", "verify-restricted"],
+            &["account", "verify-email-restricted"],
+            &["account", "reset-password"],
+            &["account", "forgot-password"],
+            &["account", "lost-password"],
+            &["account", "change-pass"],
+            &["account", "change-password"],
+            &["account", "register"],
+            &["account", "apiservers"],
+            &["account", "api-servers"],
+            &["account", "set-server"],
+            &["account", "set-api-server"],
+            &["account", "language"],
+            &["account", "set-language"],
+            &["account", "promo"],
+            &["download", "link"],
+            &["dl", "file"],
+            &["notifications", "list"],
+            &["notif", "ls"],
+            &["notifications", "mark-read", "42"],
+            &["session", "status"],
+            &["session", "st"],
+            &["backup", "snapshot-create"],
+            &["backup", "snapshot-restore"],
+            &["backup", "snapshot-verify"],
+            &["backup", "snapshot-prune"],
+            &["backup", "delete"],
+            &["backup", "rm"],
+            &["backup", "create"],
+            &["backup", "stop-device"],
+            &["backup", "delete-device"],
+            &["snapshot"],
+            &["snapshot", "create"],
+            &["snapshot", "restore"],
+            &["snapshot", "verify"],
+            &["snapshot", "prune"],
+            &["audit", "verify"],
+            &["integrity"],
+            &["integrity", "status"],
+            &["integrity", "st"],
+            &["integrity", "run-once"],
+            &["integrity", "run_once"],
+            &["integrity", "skip"],
+            &["ha"],
+            &["ha", "status"],
+            &["ha", "st"],
+            &["audit-verifier"],
+            &["audit-verifier", "status"],
+            &["audit-verifier", "st"],
+            &["upload"],
+            &["upload", "create"],
+            &["upload", "pause"],
+            &["upload", "resume"],
+            &["upload", "cancel"],
+            &["upload", "list"],
+            &["upload", "ls"],
+            &["upload", "write-from-file"],
+            &["upload", "writefromfile"],
+            &["mount", "--force-umount"],
+            &["auth", "account-secret", "--allow-argv-password"],
+        ];
+
+        for tokens in successful {
+            let mut args = vec!["pcloudc".to_owned()];
+            args.extend(tokens.iter().map(|token| (*token).to_owned()));
+            super::normalize_args(&args)
+                .unwrap_or_else(|error| panic!("{tokens:?} did not normalize: {error}"));
+        }
+
+        let invalid: &[&[&str]] = &[
+            &["sync"],
+            &["sync", "unknown"],
+            &["sync", "exclude"],
+            &["sync", "exclude", "unknown"],
+            &["conflict"],
+            &["conflict", "unknown"],
+            &["publink"],
+            &["publink", "unknown"],
+            &["folder"],
+            &["folder", "unknown"],
+            &["fs"],
+            &["fs", "unknown"],
+            &["crypto"],
+            &["crypto", "unknown"],
+            &["account"],
+            &["account", "unknown"],
+            &["download"],
+            &["download", "unknown"],
+            &["notifications", "mark-read"],
+            &["notifications", "mark-read", "not-a-number"],
+            &["notifications", "unknown"],
+            &["session"],
+            &["session", "unknown"],
+            &["backup"],
+            &["backup", "unknown"],
+            &["snapshot", "unknown"],
+            &["audit"],
+            &["audit", "unknown"],
+            &["integrity", "unknown"],
+            &["ha", "unknown"],
+            &["audit-verifier", "unknown"],
+            &["upload", "unknown"],
+        ];
+        for tokens in invalid {
+            let mut args = vec!["pcloudc".to_owned()];
+            args.extend(tokens.iter().map(|token| (*token).to_owned()));
+            assert!(
+                matches!(
+                    super::normalize_args(&args),
+                    Err(CommandParseError::UnknownCommand(_))
+                ),
+                "{tokens:?} must be rejected"
+            );
         }
     }
 }

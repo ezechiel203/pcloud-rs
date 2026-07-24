@@ -1,24 +1,30 @@
 # Testing
 
-The workspace runs a **seven-layer testing pyramid**. Every layer gates on
-CI; every layer is runnable locally with the commands below. The goal is
+The workspace runs a **seven-layer testing pyramid**. The goal is
 not "more tests" — it is **different classes of evidence** that the code is
 correct. A unit test proves a branch is taken. A property test proves an
 invariant holds over thousands of inputs. A fuzz target proves no adversary
 input causes a panic or memory error. A mutation run proves the tests
 actually catch a broken implementation.
 
+> **Honesty note (2026-04-26, audit-06 wave-G8 M-01):** Not all layers are
+> currently enforced as hard PR gates. The table's "CI gate" column describes
+> the intended policy and current enforcement. Scheduled/manual layers do not
+> block ordinary pull requests, but a failure in a job that does run is not
+> silently converted to success. Release-selected live tests are separately
+> hard-gated.
+
 ## The Pyramid at a Glance
 
-| Layer              | Count / scope                                  | Local cadence | CI gate                      |
-| ------------------ | ---------------------------------------------- | ------------- | ---------------------------- |
-| Unit tests         | **1247 passing** across the workspace          | Every change  | Every PR, blocking           |
-| Property tests     | **7 properties × 128 cases** each              | Every change  | Every PR, blocking           |
-| Fuzz targets       | 4 targets, cargo-fuzz, 10 min / target         | Nightly       | Nightly CI, blocking         |
-| Mutation testing   | `cargo-mutants`, 4 crates, **75 % MMR floor**  | Manual / weekly | Weekly Sun 03:00 UTC       |
-| Chaos scenarios    | **5 scenarios** in `pcloud-chaos`              | Manual        | Weekly + opt-in env flag     |
-| Coverage           | `cargo-llvm-cov`, **65 % → 80 %** ratchet      | Every change  | Every PR, blocking           |
-| Live E2E           | Tag-gated against real account                 | Pre-release   | Release candidates only      |
+| Layer              | Count / scope                                  | Local cadence | CI gate (current enforcement)                |
+| ------------------ | ---------------------------------------------- | ------------- | -------------------------------------------- |
+| Unit tests         | see `cargo test --workspace --locked` output   | Every change  | Every PR, blocking                           |
+| Property tests     | 10 `proptest` modules; module-specific budgets | Every change  | Every PR, blocking                           |
+| Fuzz targets       | 14 targets across 5 fuzz workspaces, 5 min each | Nightly     | Scheduled/manual jobs fail on crashes       |
+| Mutation testing   | `cargo-mutants`, 5 crates, **75 % MMR floor**  | Manual / weekly | *(not yet in CI)*                          |
+| Chaos scenarios    | **5 scenarios** in `pcloud-chaos`              | Manual        | *(not yet in CI; deferred, see ci.yml)*      |
+| Coverage           | `cargo-llvm-cov`, 65% workspace + critical floors | Weekly / manual | Push/PR and weekly/manual hard floors    |
+| Live E2E           | broad weekly/manual suite + strict release subset | Weekly / release | Release transfer/share/Linux-mount gates |
 
 ## 1. Unit Tests
 
@@ -41,44 +47,43 @@ cargo test --workspace --locked
 **Iterate on one crate:**
 
 ```sh
-cargo test -p pcloud-daemon --lib -- --nocapture
+cargo test -p pcloud-daemon --lib --locked -- --nocapture
 ```
 
-Current count: **1247 passing**. Expect 5–10 new unit tests per new
-feature; commands missing unit coverage fail review.
+Current count: use `cargo test --workspace --locked` output from the
+current branch; do not copy historical counts into reviews. Expect 5–10
+new unit tests per new feature; commands missing unit coverage fail
+review.
 
 **CI gate:** runs on every PR. A single failure blocks merge.
 
 ## 2. Property Tests
 
 We use `proptest` to generate inputs and assert invariants. The workspace
-currently ships **seven properties** with **128 cases each**, split
-between two crates:
+currently has ten property-test modules across `pcloud-crypto`,
+`pcloud-daemon`, `pcloud-ipc`, `pcloud-proto`, `pcloud-resilience`,
+`pcloud-embedded-sdk`, and `pcloud-secret`. They cover:
 
-### `pcloud-ipc` — `proptest_framer` (4 properties)
+- frame, response, request, and method round-trips plus malformed input,
+- encryption/decryption, redaction, constant-time equality, and zeroization,
+- sync/resolver state transitions and upload-session progress,
+- circuit-breaker behavior over generated failure sequences.
 
-- length-prefix framer round-trips for arbitrary payload lengths,
-- decoding tolerates arbitrary chunk-boundary splits,
-- oversize payloads are rejected deterministically,
-- idempotent re-encode after a round-trip.
-
-### `pcloud-crypto` — `proptest_seal` (3 properties)
-
-- `SecretBytes` + `SealedBox` round-trip preserves plaintext,
-- single-bit tamper detection fires deterministically,
-- empty and max-length plaintexts encode and decode cleanly.
+Case budgets are module-specific. The protocol framer and crypto sealing suites
+pin 128 cases for predictable PR latency; other suites use the repository's
+current `proptest` defaults unless their source specifies a local budget.
 
 **Run locally:**
 
 ```sh
-cargo test -p pcloud-ipc    -- proptest_framer
-cargo test -p pcloud-crypto -- proptest_seal
+cargo test -p pcloud-proto  --locked --test proptest_framer
+cargo test -p pcloud-crypto --locked --test proptest_seal
 ```
 
 **Deep-dive with more cases:**
 
 ```sh
-PROPTEST_CASES=10000 cargo test -p pcloud-ipc -- proptest_framer
+PROPTEST_CASES=10000 cargo test -p pcloud-proto --locked --test proptest_framer
 ```
 
 Failing inputs auto-shrink to a minimal counter-example and persist in
@@ -90,26 +95,35 @@ failing case is always re-checked.
 ## 3. Fuzz Targets
 
 Fuzz targets run under `cargo-fuzz` (libFuzzer) on a nightly toolchain.
+The authoritative target list is the matrix in `.github/workflows/fuzz.yml`.
 Current targets:
 
-- `pcloud-ipc/fuzz/fuzz_targets/framer.rs` — IPC decoder
-- `pcloud-proto/fuzz/fuzz_targets/response_parser.rs` — server response JSON
-- `pcloud-crypto/fuzz/fuzz_targets/sealed_box.rs` — sealed-box decoder
-- `pcloud-fs/fuzz/fuzz_targets/journal.rs` — journal replay
+- `pcloud-ipc`: `fuzz_ipc_frame` — IPC frame decoder
+- `pcloud-crypto`: `fuzz_open_sector` — sector AEAD decoder
+- `pcloud-crypto`: `fuzz_pclsync_filename_decode` — pclsync base32+AES filename decoder
+- `pcloud-daemon`: `fuzz_auth_vault_decode` — auth-vault token parser
+- `pcloud-proto`: `fuzz_auth_flow_state`, `fuzz_binary_request_roundtrip`,
+  `fuzz_ipc_method_decode`, `fuzz_json_response`, `fuzz_path_canonicalize`,
+  `fuzz_response_parser`, `fuzz_listfolder_response`
+- cross-crate root workspace: `transport_frame`, `ipc_request`,
+  `public_link_uri`
 
 **Run locally** (nightly toolchain required):
 
 ```sh
-rustup toolchain install nightly
-cargo +nightly fuzz run framer -- -max_total_time=300
+rustup toolchain install nightly-2026-06-03
+cd crates/pcloud-ipc
+cargo +nightly-2026-06-03 fuzz run fuzz_ipc_frame -- -max_total_time=300
 ```
 
-Corpora live under `fuzz/corpus/<target>/` and are seeded from real
-payloads. New panics or OOMs are automatically minimised and filed as a
-bead tagged `fuzz-finding` with the reproducer attached.
+Corpora live under `<crate>/fuzz/corpus/<target>/` and are cached by CI.
+When a crash is found, minimize with `cargo fuzz tmin` and commit the
+reproducer as a regression seed.
 
-**CI gate:** nightly job runs each target for **10 minutes**. A new crash
-or slow unit blocks the next release tag until the bead is triaged.
+**CI gate (current):** scheduled/manual matrix. Every fuzz target is wired;
+crashes fail the owning job and artifacts are retained with `if: always()`.
+A crash generates an artifact for human triage but does not block PRs.
+Tracked under `bd-1du.10` for hardening.
 
 ## 4. Mutation Testing
 
@@ -118,7 +132,7 @@ mutation the tests did not catch. A surviving mutation is direct evidence
 that a branch is not actually exercised, even if line coverage shows
 green.
 
-**Scope:** 4 crates on the weekly schedule:
+**Scope:** 5 crates for the manual/weekly release check:
 
 - `pcloud-crypto`
 - `pcloud-auth`
@@ -126,36 +140,35 @@ green.
 - `pcloud-secret`
 - `pcloud-ipc`
 
-**Floor:** **75 % mutants must be caught** per crate (the Minimum
-Mutation Ratio — MMR). A drop below floor blocks the weekly job and
-opens a triage bead.
+**Floor:** **75 % mutants must be caught** per crate (Minimum Mutation
+Ratio — MMR). A drop below floor opens a triage bead.
 
-**Schedule:** weekly, **Sundays at 03:00 UTC**, via a dedicated GitHub
-Actions workflow. The run takes ~4 hours across the four crates.
+**Schedule (current):** *(not yet in CI)* — no dedicated GitHub Actions
+workflow exists. Run locally before cutting a release tag. Tracked under
+`bd-1du.10`.
 
 **Run locally on a single crate:**
 
 ```sh
-cargo install cargo-mutants
+cargo install cargo-mutants --locked
 cargo mutants -p pcloud-crypto --timeout 60
 ```
 
-CI uploads `mutants.out/` as an artefact. Triage surviving mutations into
-beads tagged `test-gap`.
+Triage surviving mutations into beads tagged `test-gap`.
 
 ## 5. Chaos Testing
 
 `crates/pcloud-chaos/` exercises the daemon under **adversarial
 environmental conditions**. Five scenarios ship:
 
-### Default-run (every CI trigger)
+### Lightweight scenarios
 
 1. **Network blackhole** during streaming download — verify resume tokens
    and idempotent retry recover cleanly.
 2. **Clock jump** (host clock jumps ±24 h mid-request) — verify auth
    token refresh and cache expiry survive.
 
-### Opt-in (`PCLOUD_CHAOS=1`)
+### Heavy opt-in (`PCLOUD_CHAOS=1`)
 
 3. **SIGKILL** mid-upload — verify journal rollback, no torn writes, no
    orphaned temp files on restart.
@@ -165,38 +178,37 @@ environmental conditions**. Five scenarios ship:
    daemon timeouts fire and do not starve other peers.
 
 The opt-in trio is heavy: each scenario serialises for minutes and
-requires privileged hooks. They run in the **weekly** chaos job and are
-skipped on normal PRs.
+requires privileged hooks. No GitHub Actions chaos workflow exists today;
+the entire chaos layer is developer-run/manual until the timing instability
+noted in `.github/workflows/ci.yml` is resolved.
 
 **Run locally (default two):**
 
 ```sh
-cargo test -p pcloud-chaos --test scenarios -- --test-threads=1
+cargo test -p pcloud-chaos --test scenarios --locked -- --test-threads=1
 ```
 
 **Run locally (full five):**
 
 ```sh
-PCLOUD_CHAOS=1 cargo test -p pcloud-chaos --test scenarios -- --test-threads=1
+PCLOUD_CHAOS=1 cargo test -p pcloud-chaos --test scenarios --locked -- --test-threads=1
 ```
 
 Chaos tests deliberately serialise (`--test-threads=1`) because they
 install process-wide signal handlers and fault injectors.
 
-**CI gate:** default two scenarios gate nightly. Full five gate weekly.
+**Local CI gate:** `cargo xtask coverage` runs the deterministic ignored chaos
+suites serially with `PCLOUD_CHAOS=1`. Longer destructive/live scenarios
+remain explicit release-operator exercises.
 
 ## 6. Coverage
 
-We use `cargo-llvm-cov` with a **ratcheting floor**:
+We use `cargo-llvm-cov` to generate line-coverage reports.
 
-- **current floor: 65 %** (line coverage, workspace-wide)
-- **target: 80 %** by the time `bd-1du.10` closes
-- the floor **ratchets upward** — PRs that lower it are blocked
+**Enforced posture:**
 
-### Per-crate floors
-
-Security-sensitive crates carry tighter per-crate floors that override the
-workspace number:
+- workspace floor: **90 %**
+- per-crate floors for security-sensitive crates:
 
 | Crate              | Floor |
 | ------------------ | ----- |
@@ -206,42 +218,46 @@ workspace number:
 | `pcloud-secret`    | 90 %  |
 | `pcloud-ipc`       | 80 %  |
 
-A drop in any of these blocks the PR regardless of the workspace number.
+**Local CI gate:** `cargo xtask coverage` publishes
+`target/xtask/lcov.info` and hard-fails through
+`scripts/coverage-check.sh` when the workspace or any critical-crate floor is
+missed. GitHub Actions is intentionally disabled.
 
 **Run locally:**
 
 ```sh
-cargo install cargo-llvm-cov
-cargo llvm-cov --workspace --summary-only
-cargo llvm-cov --workspace --html     # browse target/llvm-cov/html/
+cargo install cargo-llvm-cov --version 0.8.7 --locked
+cargo xtask coverage
 ```
-
-**CI gate:** a custom script compares the PR's coverage to `main`'s and
-to `ci/coverage-floor.toml`. The floor never lowers automatically —
-increases land as explicit commits updating `ci/coverage-floor.toml`
-with a changelog entry.
 
 ## 7. Live End-to-End Tests
 
 `crates/pcloud-live-e2e/` contains tests that require a real pCloud
-account. These are **tag-gated**: they do not run on PRs unless the
-PR carries the `live-e2e` label, and they always run on release
-candidates.
+account. Every test function carries `#[ignore]` and a runtime gate
+(`PCLOUD_LIVE_E2E=1`), so a plain `cargo test` never runs them.
+
+The broad suite runs weekly and on manual dispatch; missing optional
+family-specific variables still skip those families. The release workflow
+selects transfer/public-link, two-account share, and Linux mount tests under
+`PCLOUD_RELEASE_GATE=1`, where missing prerequisites and degraded behavior are
+failures. See `crates/pcloud-live-e2e/README.md`.
 
 ```sh
 export PCLOUD_LIVE_E2E=1
-export PCLOUD_E2E_USERNAME=staging-bot@example.com
-export PCLOUD_E2E_PASSWORD=…          # use a vaulted env
-export PCLOUD_E2E_TFA_SECRET=…        # optional, for TFA scenarios
+export PCLOUD_TEST_USER=staging-bot@example.com
+export PCLOUD_TEST_PASSWORD=…          # use a vaulted env
 
-cargo test -p pcloud-live-e2e --locked
+cargo test -p pcloud-live-e2e --locked -- --ignored --test-threads=1
 ```
 
 The staging account credentials live in the release team's 1Password
 vault. **Never** wire a personal account to CI.
 
-**CI gate:** runs only on release candidate tags (`rc-*`) and on PRs
-explicitly labelled `live-e2e`. A failure blocks the release tag.
+**CI gate:** `.github/workflows/ci.yml` runs the broad suite only on the weekly
+schedule and manual `workflow_dispatch`; failures are not swallowed. The tag
+release workflow separately selects strict transfer/public-link,
+two-account-share, and native Linux mount tests with
+`PCLOUD_RELEASE_GATE=1`, so those paths block publication.
 
 ## Running Everything Locally
 
@@ -250,11 +266,12 @@ Before a big PR, run the full pre-merge gate:
 ```sh
 cd .
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test   --workspace --locked
-cargo llvm-cov --workspace --summary-only
-cargo audit --deny warnings
-cargo deny check
+cargo llvm-cov --workspace --locked --summary-only
+cargo audit --deny warnings \
+  --ignore RUSTSEC-2023-0071
+cargo deny --locked check
 ```
 
 Nightly-only layers (fuzz, mutants, full chaos) are opt-in locally but

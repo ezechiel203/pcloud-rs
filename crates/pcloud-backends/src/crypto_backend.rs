@@ -41,6 +41,17 @@ impl ProtocolTransport for DevelopmentCryptoTransport {
 
     fn execute(&self, request: &EncodedRequest) -> Result<Value, Self::Error> {
         let frame = match request.frame.command.as_str() {
+            "crypto_getuserkeys" => {
+                let auth = string_param(request, "auth").unwrap_or("");
+                if auth.is_empty() {
+                    simple_hash(&[("result", 2000u64), ("error_kind", 3u64)])
+                } else {
+                    // Development mode has no server-side vault: report
+                    // 2111 (crypto not set up) so the daemon exercises its
+                    // fresh-setup fallback.
+                    simple_hash(&[("result", 2111u64)])
+                }
+            }
             "crypto_sendchangeuserprivate" => {
                 // Require an auth param to be present and non-empty.
                 let auth = string_param(request, "auth").unwrap_or("");
@@ -251,6 +262,17 @@ impl CryptoRuntime {
             .change_user_private(auth_token, private_key, signature, hint, code)
     }
 
+    /// Download the account's `priv_key_ver1` / `pub_key_ver1` blobs via
+    /// `crypto_getuserkeys`. Returns `Ok(None)` when the server reports
+    /// result 2111 (crypto not set up) — the daemon then falls back to a
+    /// fresh local setup instead of server-key adoption.
+    pub fn get_user_keys(
+        &self,
+        auth_token: &str,
+    ) -> Result<Option<pcloud_proto::CryptoUserKeys>, CryptoApiError<CryptoBackendError>> {
+        self.api.get_user_keys(auth_token)
+    }
+
     /// Upload a PclsyncCompat crypto-setup keypair via
     /// `crypto_setuserkeys`. Stage 4b.3 daemon wiring.
     ///
@@ -292,6 +314,19 @@ impl CryptoRuntime {
         file_id: u64,
     ) -> Result<(u64, Vec<u8>), CryptoApiError<CryptoBackendError>> {
         self.api.get_file_key(auth_token, file_id)
+    }
+
+    /// Fetch a recipient's `pub_key_ver1` blob via `crypto_getpubkey`.
+    /// CLAUDEREV deferred-set D6 (fire 56). Used by the daemon-side
+    /// `crypto_share_folder_rsa` orchestrator to produce the
+    /// `recipient_pub_blob` argument that
+    /// `SharesRuntime::crypto_share_folder_rsa` needs.
+    pub fn get_pub_key(
+        &self,
+        auth_token: &str,
+        recipient: pcloud_proto::methods::crypto::CryptoPubKeyRecipient,
+    ) -> Result<Vec<u8>, CryptoApiError<CryptoBackendError>> {
+        self.api.get_pub_key(auth_token, recipient)
     }
 }
 

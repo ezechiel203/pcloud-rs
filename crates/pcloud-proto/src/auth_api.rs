@@ -106,12 +106,20 @@ pub struct ApiServerHint {
 }
 
 /// `PasswordLoginOutcome` — password login outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// CLAUDEREV iter-1 SEC-H fix: `auth_token` and `challenge_token` are
+/// `SecretString` so they zeroize on drop, redact in `Debug`, and never
+/// transit as raw `String`. The enum drops `Clone`, `PartialEq`, `Eq`
+/// because `SecretString` is intentionally not `Clone` (use
+/// `SecretString::clone_secret` for explicit duplication) and equality
+/// on a credential is a leak vector.
+#[derive(Debug)]
 pub enum PasswordLoginOutcome {
     /// `Authenticated` variant (authenticated).
     Authenticated {
-        /// The `auth_token` field (auth token).
-        auth_token: String,
+        /// The `auth_token` field (auth token). `SecretString` per
+        /// CLAUDEREV iter-1 SEC-H fix.
+        auth_token: SecretString,
         /// The `user_id` field (user id).
         user_id: Option<u64>,
         /// The `api_server` field (api server).
@@ -119,8 +127,9 @@ pub enum PasswordLoginOutcome {
     },
     /// `TwoFactorRequired` variant (two factor required).
     TwoFactorRequired {
-        /// The `challenge_token` field (challenge token).
-        challenge_token: String,
+        /// The `challenge_token` field (challenge token). `SecretString`
+        /// per CLAUDEREV iter-1 SEC-H fix.
+        challenge_token: SecretString,
         /// The `trust_device` field (trust device).
         trust_device: bool,
         /// The `api_server` field (api server).
@@ -524,7 +533,7 @@ where
             "missing auth token on successful login",
         ))?;
         return Ok(PasswordLoginOutcome::Authenticated {
-            auth_token: auth_token.to_owned(),
+            auth_token: SecretString::new(auth_token.to_owned()),
             user_id: hash.get_number("userid"),
             api_server: extract_api_server_hint(hash),
         });
@@ -535,15 +544,21 @@ where
         .or_else(|| hash.get_string("tfa_token"))
     {
         return Ok(PasswordLoginOutcome::TwoFactorRequired {
-            challenge_token: challenge_token.to_owned(),
+            challenge_token: SecretString::new(challenge_token.to_owned()),
             trust_device: hash.get_bool("trustdevice").unwrap_or(false),
             api_server: extract_api_server_hint(hash),
         });
     }
 
-    if result == 2297 {
+    if result == 2297 || result == 1022 {
+        // 2297: server-side TFA challenge (token normally arrives in the
+        // `token` field handled above; tolerate its absence).
+        // 1022 ("Please provide 'code.'"): token-less email/new-device
+        // verification challenge — the correct retry is a plain `login`
+        // carrying the `code` parameter, which the empty challenge token
+        // signals downstream.
         return Ok(PasswordLoginOutcome::TwoFactorRequired {
-            challenge_token: String::new(),
+            challenge_token: SecretString::new(String::new()),
             trust_device: hash.get_bool("trustdevice").unwrap_or(false),
             api_server: extract_api_server_hint(hash),
         });
@@ -675,6 +690,7 @@ mod tests {
     use crate::response::Value;
 
     use super::{ApiServerHintConsumer, AuthApi, PasswordLoginOutcome, ProtocolTransport};
+    use pcloud_secret::ExposeSecret;
 
     #[derive(Debug)]
     struct HintTrackingTransport {
@@ -856,6 +872,40 @@ mod tests {
                 .as_slice(),
             ["bineapi-tfa.pcloud.com"]
         );
+    }
+
+    #[test]
+    fn login_maps_result_1022_to_tokenless_two_factor_challenge() {
+        let transport = HintTrackingTransport::with_responses(vec![
+            Value::Hash(vec![
+                ("result".to_owned(), Value::Number(0)),
+                (
+                    "digest".to_owned(),
+                    Value::String("development-digest".to_owned()),
+                ),
+            ]),
+            Value::Hash(vec![
+                ("result".to_owned(), Value::Number(1022)),
+                (
+                    "error".to_owned(),
+                    Value::String("Please provide 'code'.".to_owned()),
+                ),
+            ]),
+        ]);
+        let api = AuthApi::new(transport);
+
+        let outcome = api
+            .login_password("bob@example.com".to_owned(), "correct-horse")
+            .expect("login should parse");
+
+        match outcome {
+            PasswordLoginOutcome::TwoFactorRequired {
+                challenge_token, ..
+            } => {
+                assert!(challenge_token.expose_secret().is_empty());
+            }
+            other => panic!("expected two-factor outcome, got {other:?}"),
+        }
     }
 
     #[test]

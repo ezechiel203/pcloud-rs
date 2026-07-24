@@ -12,22 +12,29 @@ Rust entry points:
 
 - Protocol clients: `crates/pcloud-proto/src/*`
 - Daemon backends:  `crates/pcloud-daemon/src/*_backend.rs`
-- SDK surface:      `crates/pcloud-sdk/src/lib.rs`
-  (`EmbeddedDaemon::*`)
+- Stable SDK:       `crates/pcloud-sdk-public/src/lib.rs`
+  (`Client::remote()` / `RemoteDrive`)
+- Embedded compatibility API: `crates/pcloud-sdk/src/lib.rs`
+  (`pcloud-embedded-sdk`, `EmbeddedDaemon::*`)
 - IPC methods:      `crates/pcloud-ipc/src/methods.rs`
 
 Legend: **I** Implemented · **P** Partial · **M** Missing · **R**
 intentionally Rejected. See the CSV for full notes per row.
 
+The method-by-method `EmbeddedDaemon` entries below describe the internal,
+unpublished compatibility API. The public `pcloud-sdk` 1.0 contract is
+intentionally narrower: it exposes filesystem and share operations through
+`RemoteDrive`, while authentication and lifecycle remain daemon-owned.
+
 ## Auth (`pcloud-proto::auth_api`)
 
 | pCloud method | Rust entry | C counterpart (psynclib.h) | Status |
 |---------------|-----------|-----------------------------|--------|
-| `userinfo` (login) | `AuthApi::userinfo` + `EmbeddedDaemon::login` | `psync_login` | I |
-| `userinfo` (token) | `EmbeddedDaemon::login_with_token` | `psync_set_auth` | I |
+| `userinfo` (login) | `EmbeddedDaemon::login(user, pass)` / `dispatch(Request::PasswordSubmission)` | `psync_login` | I |
+| `userinfo` (token) | `EmbeddedDaemon::login_with_token(token)` / `dispatch(Request::AuthTokenSubmission)` | `psync_set_auth` | I |
 | `userinfo` (authed) | `EmbeddedDaemon::userinfo` | `psync_get_userinfo` | I |
-| TFA code | `EmbeddedDaemon::submit_two_factor_code` | `psync_tfa_*` | I |
-| TFA recovery | `EmbeddedDaemon::submit_recovery_code` | `psync_tfa_*` | I |
+| TFA code | `EmbeddedDaemon::submit_two_factor_code(code, trust, false)` | `psync_tfa_*` | I |
+| TFA recovery | `EmbeddedDaemon::submit_recovery_code(code, trust)` / `submit_two_factor_code(code, trust, true)` | `psync_tfa_*` | I |
 | TFA SMS resend | `EmbeddedDaemon::send_two_factor_sms` | `psync_tfa_send_sms` | I |
 | TFA push resend | `EmbeddedDaemon::send_two_factor_notification` | `psync_tfa_send_notif` | I |
 | `verifyemail` | `AccountApi::verify_email` | `psync_verify_email` | I |
@@ -37,8 +44,8 @@ intentionally Rejected. See the CSV for full notes per row.
 | `logout` | `EmbeddedDaemon::logout` | `psync_unlink` | I |
 | `register` | `AccountApi::register` via `EmbeddedDaemon::register` | `psync_register` | I |
 | notification cb | — | `psync_set_notification_callback` | R (event stream) |
-| `tfa_has_devices` | — | `psync_tfa_has_devices` | P (row 23) — resend helpers exist; no surface to query enrolled TFA device list |
-| `tfa_type` | — | `psync_tfa_type` | P (row 24) — boolean TwoFactorRequired state tracked; no TfaMethod enum distinguishing sms/totp/notification/recovery |
+| `tfa_has_devices` | — | `psync_tfa_has_devices` | R (row 23, flipped Rejected audit-06 ncx.4) — C desktop-UI helper; device list returned in-band by `send_two_factor_notification` |
+| `tfa_type` | — | `psync_tfa_type` | R (row 24, flipped Rejected audit-06 ncx.4) — C desktop-UI helper; method dispatch is caller-driven |
 
 ## Sync root management (`pcloud-daemon::sync_backend`)
 
@@ -56,11 +63,11 @@ intentionally Rejected. See the CSV for full notes per row.
 
 ## Transfers (`pcloud-proto::transfer_api`, `async_transfer`, `http_download`)
 
-Row 93 (`upload_writefromfile` server-side copy) is **Partial**: the proto
-encoder and IPC variant exist; the daemon handler intentionally returns
-`not-yet-wired` after audit 04 found the prior shim was a local-file re-upload
-rather than a server-side copy from a remote `fileid`. See
-`crates/pcloud-backends/src/transfer_backend.rs:445` and `bd-1du`.
+Row 93 (`upload_writefromfile`) is **Implemented** as of the GPTREV Worker 4
+reconciliation (2026-04-30). The proto primitive, backend runtime, daemon
+dispatch, CLI, and SDK all expose separate destination `uploadoffset` and
+source `offset` values for the server-side-copy C shape. See
+`STATUS.md` for the authoritative tally.
 
 | Operation | Rust entry | C counterpart | Status |
 |-----------|-----------|---------------|--------|
@@ -68,10 +75,11 @@ rather than a server-side copy from a remote `fileid`. See
 | `upload_create` | `TransferApi::upload_create` | `psync_upload_create` | I |
 | `upload_write` | `TransferApi::upload_write` | `psync_upload_write` | I |
 | `upload_save` | `TransferApi::upload_save` | `psync_upload_save` | I |
-| `upload_writefromfile` (server-side copy) | proto encoder exists; handler not yet wired | `upload_writefromfile` | P (row 93, `bd-1du`) |
+| `upload_writefromfile` (server-side copy) | `TransferRuntime::upload_write_from_file` / `Request::UploadWriteFromFile` / `pcloudc upload write-from-file` / `EmbeddedDaemon::upload_write_from_file` | `upload_writefromfile` | I (row 93; distinct upload/source offsets exposed) |
 | signed HTTP download | `http_download::execute` | internal | I |
 | SDK `upload_file` / `_as` | `EmbeddedDaemon::upload_file{_as}` | convenience | I |
 | SDK `upload_data` / `_as` | `EmbeddedDaemon::upload_data{_as}` | convenience | I |
+| SDK `UploadSession` public route | `EmbeddedDaemon::start_upload` | upload-session convenience | I (row 94) |
 | SDK `download_file` | `EmbeddedDaemon::download_file` | convenience | I |
 | per-download state query | — | `psync_download_state` | R (C body is a `return 0` stub; Rust transfer runtime exposes real per-transfer state via IPC) |
 
@@ -80,9 +88,9 @@ rather than a server-side copy from a remote `fileid`. See
 | Operation | Rust entry | C counterpart | Status |
 |-----------|-----------|---------------|--------|
 | file link create | `create_file_public_link` | `psync_file_public_link` | I |
-| folder link create | `create_folder_public_link{_with_options}` | `psync_folder_public_link{_full}` | I |
+| folder link create | `create_folder_public_link` | `psync_folder_public_link` | I |
 | tree link create (ids) | `create_tree_public_link` | `psync_tree_public_link` | I |
-| tree link create (paths) | `Request::CreateTreePublicLinkFromPaths` / `PublicLinkPathResolver` | path-based shape | I |
+| tree link create (paths) | `Request::CreateTreePublicLinkFromPathTargets` / `PublicLinkPathResolver` / SDK `create_tree_public_link_from_targets` | path-based root/folder/file shape | I |
 | list publinks | `list_public_links` | `psync_list_publinks` | I |
 | list uploadlinks | `list_upload_links` | `psync_list_uploadlinks` | I |
 | show link | `show_public_link` | `psync_show_publink` | I |
@@ -90,8 +98,9 @@ rather than a server-side copy from a remote `fileid`. See
 | changepublink expire/password/limits/upload | `change_public_link::*` | `psync_change_publink` | I |
 | upload link create | `create_upload_link` | `psync_upload_link` | I |
 | upload link delete | `delete_upload_link` | `psync_delete_uploadlink` | I |
-| upload access / send-email | `create_folder_updownlink` | `psync_folder_updownlink` | I |
-| screenshot link | `create_screenshot_public_link` | `psync_screenshot_publink` | I |
+| folder link with options | backend `create_folder_public_link_with_options` only; no IPC/daemon/CLI | `psync_folder_public_link_full` | P (row 147 — reachability gap, gptrev-01 H-01, 2026-04-29) |
+| upload access / send-email | backend `create_folder_updownlink` only; no IPC/daemon/CLI | `psync_folder_updownlink` | P (row 148 — reachability gap, gptrev-01 H-01, 2026-04-29) |
+| screenshot link | backend `create_screenshot_public_link` only; no IPC/daemon/CLI | `psync_screenshot_publink` | P (row 168 — reachability gap, gptrev-01 H-01, 2026-04-29) |
 | bookmarks / pins | helpers in `public_link_backend` | `psync_*_bookmark` | I |
 | link cache warmup | — | C-internal helper | R |
 
@@ -118,9 +127,9 @@ rather than a server-side copy from a remote `fileid`. See
 | list share requests | `SharesApi::list_share_requests` | `psync_list_share_requests` | I |
 | list shares | `SharesApi::list_shares` | `psync_list_shares` | I |
 | share folder | `SharesApi::share_folder` | `psync_account_sharefolder` | I |
-| crypto share folder | `SharesApi::crypto_share_folder` + `pcloud-crypto::share_temppass` | `psync_crypto_sharefolder` | P (row 124) — symmetric-signature-only; RSA-4096 path pending (`bd-1du.5`); share invitations non-functional for C-client recipients |
+| crypto share folder (RSA path) | `SharesRuntime::crypto_share_folder_rsa` backend only; no IPC route | `psync_crypto_sharefolder` | P (rows 124+138) — RSA backend landed; `Request::CryptoShareFolder` IPC missing; live E2E: `bd-1du.5`/`pcloud-rs-ncx.89-e2e` |
 | account team share | `SharesRuntime::account_team_share` | `psync_account_teamshare` | I |
-| crypto account team share | `SharesApi::crypto_account_team_share` + `pcloud-crypto::share_temppass` | `psync_crypto_account_teamshare` | P (row 142) — symmetric-signature-only; RSA-4096 path pending (`bd-1du.5`); team-share invitations non-functional for C-client recipients |
+| crypto account team share (RSA path) | `SharesRuntime::crypto_account_team_share_rsa` backend only; no IPC route | `psync_crypto_account_teamshare` | P (row 142) — RSA backend landed; `Request::CryptoAccountTeamShare` IPC missing; live E2E: `bd-1du.5`/`pcloud-rs-ncx.89-e2e` |
 | contacts | `SharesRuntime::list_contacts` | `psync_contactlist` | I |
 | my teams | `SharesRuntime::list_my_teams` | `psync_list_myteams` | I |
 | stop share (multi-id) | `SharesApi::account_stop_share` | `psync_account_stopshare` | I |

@@ -313,7 +313,7 @@ pub struct EngineShell {
     /// [`Self::evict_sync_root`] and drained by the sync loop runtime
     /// after each cycle via [`Self::drain_watcher_evictions`].
     ///
-    /// The engine itself does not own [`pcloud_fs::fs_watcher::FsWatcher`]
+    /// The engine itself does not own `pcloud_fs::fs_watcher::FsWatcher`
     /// handles — those live on the sync loop runtime — but the engine is
     /// the single place where a sync root is semantically evicted. This
     /// queue closes the gap where a code path that goes through
@@ -721,8 +721,33 @@ impl EngineShell {
     ///
     /// On success the matched conflict is removed from the scheduler
     /// queue (it has been resolved).
+    /// Resolve a single conflict by path using the given policy string.
+    /// Returns `Ok(resolution)` if the path matched a queued conflict,
+    /// or `Err(reason)` if no conflict with that path exists.
+    ///
+    /// Valid policy strings: `"prefer_local"`, `"prefer_remote"`,
+    /// `"newest_wins"`, `"rename_both"`. Any other value is treated as
+    /// `"manual_review"` (no-op).
+    ///
+    /// On success the matched conflict is removed from the scheduler
+    /// queue (it has been resolved).
     pub fn resolve_conflict_by_path(
         &mut self,
+        path: &str,
+        policy: &str,
+    ) -> Result<ConflictResolution, String> {
+        self.resolve_conflict_by_sync_id_and_path(None, path, policy)
+    }
+
+    /// Resolve a conflict keyed by an explicit `(sync_id, path)` pair.
+    ///
+    /// F-11: Use this when multiple sync roots may share the same relative
+    /// path and you need to be certain you are targeting the correct root.
+    /// `sync_id = None` falls back to path-only matching (backward-compat
+    /// with `resolve_conflict_by_path`).
+    pub fn resolve_conflict_by_sync_id_and_path(
+        &mut self,
+        sync_id: Option<SyncId>,
         path: &str,
         policy: &str,
     ) -> Result<ConflictResolution, String> {
@@ -732,8 +757,25 @@ impl EngineShell {
             .scheduler
             .queued_operations
             .iter()
-            .position(|op| matches!(op, PlannedOperation::Conflict { path: p, .. } if p == path))
-            .ok_or_else(|| format!("no queued conflict at path: {path}"))?;
+            .position(|op| {
+                if let PlannedOperation::Conflict {
+                    path: p,
+                    sync_id: sid,
+                    ..
+                } = op
+                {
+                    p == path && sync_id.is_none_or(|id| id == *sid)
+                } else {
+                    false
+                }
+            })
+            .ok_or_else(|| {
+                if let Some(id) = sync_id {
+                    format!("no queued conflict at sync_id={} path: {path}", id.get())
+                } else {
+                    format!("no queued conflict at path: {path}")
+                }
+            })?;
 
         let op = &self.scheduler.queued_operations[idx];
         let override_policy = match policy {
@@ -774,7 +816,7 @@ impl EngineShell {
     /// batch (which may be empty if all work is now in-flight or the
     /// queue was empty).
     ///
-    /// Uses [`Scheduler::next_batch`] which enforces per-root fairness
+    /// Uses `Scheduler::next_batch` which enforces per-root fairness
     /// so that a single high-throughput sync root cannot monopolize the
     /// batch window and starve siblings. Items are removed from the
     /// queue atomically by `next_batch`.
@@ -801,13 +843,59 @@ impl EngineShell {
         self.uploads.mark_failed(path, error.clone()) || self.downloads.mark_failed(path, error)
     }
 
+    /// Re-enqueue a [`PlannedOperation`] that a previous attempt classified
+    /// as [`pcloud_model::transfer::FailureDisposition::RetryLater`].
+    ///
+    /// F-05: The recovery classifier returns `RetryLater` for transient
+    /// network failures, but previously `mark_transfer_failed` only moved
+    /// work into the coordinator's failed list, never back into the
+    /// scheduler. Callers that obtain a `RetryLater` disposition from
+    /// [`Self::classify_failure`] should call this method (after honouring
+    /// any backoff delay) to put the operation back on the active schedule.
+    ///
+    /// The operation is pushed to the **front** of the scheduler queue so
+    /// transient-failure retries are tried again on the very next
+    /// `advance_transfer_cycle` call rather than being deprioritised behind
+    /// freshly discovered work. The stale failed-list entry for `path` is
+    /// cleared from both coordinators as a side effect.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use pcloud_engine::EngineShell;
+    /// use pcloud_model::ids::SyncId;
+    /// use pcloud_model::sync::PlannedOperation;
+    ///
+    /// let mut engine = EngineShell::new();
+    /// let op = PlannedOperation::UploadFile {
+    ///     sync_id: SyncId::new(1),
+    ///     path: "docs/report.txt".into(),
+    ///     remote_parent_folder_id: None,
+    ///     remote_name: "report.txt".into(),
+    /// };
+    /// engine.requeue_for_retry(op.clone());
+    /// // The operation is now at the front of the scheduler queue.
+    /// assert_eq!(
+    ///     engine.advance_transfer_cycle().first(),
+    ///     Some(&op),
+    /// );
+    /// ```
+    pub fn requeue_for_retry(&mut self, operation: PlannedOperation) {
+        // Clear from failed lists so the retry attempt starts clean.
+        let path = operation.path().to_owned();
+        self.uploads.clear_failed(&path);
+        self.downloads.clear_failed(&path);
+        // Push to front so the retry is attempted before any newly queued work.
+        self.scheduler.queued_operations.insert(0, operation);
+    }
+
     /// Remove all queued and in-flight work associated with `sync_id`
     /// across the scheduler and both transfer coordinators. Used when a
     /// sync root is removed.
     ///
     /// pcloud-rs-774: also records `sync_id` in the pending-watcher-
     /// eviction queue so the embedding runtime can drop the associated
-    /// [`pcloud_fs::fs_watcher::FsWatcher`] handle on its next cycle
+    /// `pcloud_fs::fs_watcher::FsWatcher` handle on its next cycle
     /// tick. The engine does not own the watcher directly; see
     /// [`Self::drain_watcher_evictions`].
     pub fn evict_sync_root(&mut self, sync_id: SyncId) {
@@ -825,7 +913,7 @@ impl EngineShell {
     /// Drain the pending-watcher-eviction queue. The embedding runtime
     /// should call this after each cycle (or whenever it processes
     /// engine-driven eviction notifications) and drop the corresponding
-    /// [`pcloud_fs::fs_watcher::FsWatcher`] handles.
+    /// `pcloud_fs::fs_watcher::FsWatcher` handles.
     ///
     /// pcloud-rs-774.
     ///
@@ -1023,7 +1111,9 @@ mod tests {
         diff_poller::RemoteDiffEntry,
         fs_events::{FsEvent, FsEventKind},
         local_scan::LocalScanEntry,
+        probe_case_insensitive_fs,
         recovery::RecoveryFailure,
+        warn_if_case_insensitive,
     };
 
     #[test]
@@ -1526,6 +1616,43 @@ mod tests {
             batch
                 .iter()
                 .any(|op| op.sync_id() == SyncId::new(2) && op.path() == "b/remote.bin")
+        );
+    }
+
+    /// CLAUDEREV iter-1 SYNC-H-04-4 fix (fire 22, 2026-04-30): the
+    /// `probe_case_insensitive_fs` helper had been dead code in the
+    /// public API. This test exercises both the probe and the
+    /// `warn_if_case_insensitive` wrapper to lock the activation
+    /// contract — the latter must (a) tolerate any FS the host can
+    /// throw at it, (b) never panic, (c) return a bool whose value
+    /// matches the underlying probe outcome.
+    #[test]
+    fn warn_if_case_insensitive_matches_probe_outcome() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let probe = probe_case_insensitive_fs(tmp.path()).expect("probe");
+        let warn = warn_if_case_insensitive(tmp.path());
+        assert_eq!(probe, warn, "wrapper return must match probe outcome");
+    }
+
+    /// `probe_case_insensitive_fs` must surface I/O errors as `Err`
+    /// rather than panic on a non-existent / unwritable directory.
+    /// `warn_if_case_insensitive` swallows the error and returns
+    /// `false` (advisory only); the test pins both contracts.
+    #[test]
+    fn probe_case_insensitive_handles_missing_directory_gracefully() {
+        let nonexistent = std::path::Path::new(
+            "/this/path/does/not/exist/pcloud-claudereveltesting-i4-sync-h-04-4",
+        );
+        let probe_result = probe_case_insensitive_fs(nonexistent);
+        assert!(
+            probe_result.is_err(),
+            "probe must surface I/O error on missing dir, got {probe_result:?}"
+        );
+        // Wrapper must NOT panic and MUST return false (advisory only).
+        let warn_result = warn_if_case_insensitive(nonexistent);
+        assert!(
+            !warn_result,
+            "wrapper must return false on probe error (advisory only)"
         );
     }
 }

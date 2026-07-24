@@ -72,6 +72,48 @@ pub fn build_cli() -> Command {
         .subcommand(sub("status", "Show current sync state"))
         .subcommand(sub("health", "Daemon health check"))
         .subcommand(sub("pending", "Check for pending transfers"))
+        .subcommand(
+            sub("ls", "List remote folder contents")
+                .arg(Arg::new("remote-path").default_value("/")),
+        )
+        .subcommand(
+            sub("get", "Download a remote file")
+                .arg(Arg::new("remote-path").required(true))
+                .arg(Arg::new("local-path"))
+                .arg(Arg::new("force").long("force").action(ArgAction::SetTrue)),
+        )
+        .subcommand(
+            sub("put", "Upload a local file")
+                .arg(Arg::new("local-path").required(true))
+                .arg(Arg::new("remote-path").required(true)),
+        )
+        .subcommand(
+            sub("cp", "Copy a remote file or folder")
+                .arg(Arg::new("from").required(true))
+                .arg(Arg::new("to").required(true)),
+        )
+        .subcommand(
+            sub("mv", "Move or rename a remote entry")
+                .arg(Arg::new("from").required(true))
+                .arg(Arg::new("to").required(true)),
+        )
+        .subcommand(
+            sub("rm", "Delete a remote entry")
+                .arg(Arg::new("remote-path").required(true))
+                .arg(
+                    Arg::new("recursive")
+                        .short('r')
+                        .long("recursive")
+                        .action(ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            sub("mkdir", "Create a remote folder").arg(Arg::new("remote-path").required(true)),
+        )
+        .subcommand(
+            sub("cat", "Stream a remote file to stdout")
+                .arg(Arg::new("remote-path").required(true)),
+        )
         .subcommand(sub("userinfo", "Show authenticated user info"))
         .subcommand(sub("pause", "Pause syncing"))
         .subcommand(sub("resume", "Resume syncing"))
@@ -87,15 +129,24 @@ pub fn build_cli() -> Command {
                         "change-type",
                         "Change sync type for a registered sync folder",
                     )
+                    // Parser expects numeric sync-id at position 2, not a local path.
                     .arg(
-                        Arg::new("local-path")
+                        Arg::new("sync-id")
                             .required(true)
-                            .help("Local path of the existing sync root"),
+                            .value_parser(clap::value_parser!(u64))
+                            .help("Numeric sync-root ID (see `sync list`)"),
                     )
                     .arg(
                         Arg::new("sync-type")
                             .required(true)
-                            .value_parser(["two-way", "upload-only", "download-only"])
+                            .value_parser([
+                                "bilateral",
+                                "full",
+                                "mirror",
+                                "download-only",
+                                "upload-only",
+                                "backup",
+                            ])
                             .help("New sync type"),
                     ),
                 )
@@ -107,9 +158,10 @@ pub fn build_cli() -> Command {
                     ),
                 )
                 .subcommand(
+                    // The runtime parser uses `--max`, not `--limit`.
                     sub("suggest", "Suggest folders suitable for syncing").arg(
-                        Arg::new("limit")
-                            .long("limit")
+                        Arg::new("max")
+                            .long("max")
                             .value_parser(clap::value_parser!(u32))
                             .help("Maximum number of suggestions to return"),
                     ),
@@ -422,7 +474,24 @@ pub fn build_cli() -> Command {
                 .subcommand(sub("pause", "Pause an in-progress upload session"))
                 .subcommand(sub("resume", "Resume a paused upload session"))
                 .subcommand(sub("cancel", "Cancel and discard an upload session"))
-                .subcommand(sub("list", "List active upload sessions")),
+                .subcommand(sub("list", "List active upload sessions"))
+                .subcommand(
+                    // Mirrors parser support at app.rs (upload write-from-file).
+                    sub(
+                        "write-from-file",
+                        "Server-side copy: write a local file into an existing upload session",
+                    )
+                    .arg(
+                        Arg::new("upload-id")
+                            .required(true)
+                            .help("Upload session ID"),
+                    )
+                    .arg(
+                        Arg::new("local-path")
+                            .required(true)
+                            .help("Local source file path"),
+                    ),
+                ),
         )
         .subcommand(
             Command::new("conflict")
@@ -474,6 +543,13 @@ pub fn build_cli() -> Command {
                         .long("fix")
                         .action(ArgAction::SetTrue)
                         .help("Attempt to repair inconsistencies"),
+                )
+                .arg(
+                    // `--yes` is accepted by the parser (see allowed_flags_for Verify).
+                    Arg::new("yes")
+                        .long("yes")
+                        .action(ArgAction::SetTrue)
+                        .help("Skip confirmation prompts (non-interactive)"),
                 ),
         )
         .subcommand(Command::new("migrate-from-c").about("Migrate state from the legacy C client"))
@@ -578,61 +654,6 @@ pub fn build_cli() -> Command {
                     ),
                 )
                 .subcommand(sub("promo", "Fetch the promotional URL for this platform")),
-        )
-        .subcommand(
-            sub(
-                "log",
-                "Show git-log-style revision history for a synced file",
-            )
-            .arg(
-                Arg::new("path")
-                    .required(true)
-                    .help("Absolute pCloud-drive path"),
-            )
-            .arg(
-                Arg::new("limit")
-                    .long("limit")
-                    .value_parser(clap::value_parser!(u32))
-                    .help("Maximum number of revisions to return"),
-            ),
-        )
-        // ncx.65: `diff` and `restore` are CLI-side stubs that always
-        // exit `Unavailable` (pCloud's public API does not expose the
-        // revision-diff / restore endpoints to third-party clients).
-        // Hide them from tab-completion so operators do not discover a
-        // command that cannot do what its name suggests. The handlers
-        // remain wired in `app.rs` so existing scripts that call them
-        // still receive the structured `Unavailable` response and the
-        // tracker pointer, rather than a silent "unknown command"
-        // surprise. Remove `.hide(true)` (and update docs) when the
-        // upstream API exposes a revision API — follow-up tracked as
-        // `pcloud-rs-07o`.
-        .subcommand(
-            sub(
-                "diff",
-                "Show diff between two file revisions (stub — Unavailable)",
-            )
-            .hide(true)
-            .arg(
-                Arg::new("path")
-                    .required(true)
-                    .help("Absolute pCloud-drive path"),
-            )
-            .arg(Arg::new("rev-a").required(true).help("First revision ID"))
-            .arg(Arg::new("rev-b").required(true).help("Second revision ID")),
-        )
-        .subcommand(
-            sub(
-                "restore",
-                "Restore a file to a specific revision (stub — Unavailable)",
-            )
-            .hide(true)
-            .arg(
-                Arg::new("path")
-                    .required(true)
-                    .help("Absolute pCloud-drive path"),
-            )
-            .arg(Arg::new("rev").required(true).help("Target revision ID")),
         )
         .subcommand(sub("mount", "Mount the pCloud filesystem"))
         .subcommand(sub("unmount", "Unmount the pCloud filesystem"))

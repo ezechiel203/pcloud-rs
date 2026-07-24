@@ -1,11 +1,12 @@
 #![forbid(unsafe_code)]
-//! # pcloud-sdk
+//! # pcloud-embedded-sdk
 //!
 //! Embeddable in-process SDK wrapping the daemon runtime as
 //! `EmbeddedDaemon`. Lets applications drive auth, transfers, sync
 //! roots, public links, crypto (when enabled), and settings without a
-//! separate daemon process. Still at partial C parity — see
-//! `C_FEATURE_PARITY_MATRIX.csv`.
+//! separate daemon process. The focused filesystem contract is exposed by
+//! [`EmbeddedDaemon::remote`]; release/platform qualification remains separate
+//! from the feature-parity tally in `C_FEATURE_PARITY_MATRIX.csv`.
 //!
 //! # Conventions across the `EmbeddedDaemon` API
 //!
@@ -46,19 +47,45 @@
 //! - **Expected latency band**: single round-trip helpers typically return
 //!   in the 100–500 ms range against the production API. Multi-step flows
 //!   (crypto rotation, downloads, chunked uploads) scale accordingly.
-//!   Local-only helpers return in microseconds. Pair with your own
-//!   timeout/backoff strategy — the SDK does not retry transparently.
+//!   Local-only helpers return in microseconds. Canonical streaming transfers
+//!   apply their documented bounded, journal-aware retries. Callers should
+//!   still apply their own timeout/backoff policy to ordinary control-plane
+//!   helpers.
 //!
 //! # Semver
 //!
-//! `pcloud-sdk` re-exports only the types defined in `upload_session` and
-//! `pcloud_proto::Notification`. Types from private workspace crates such as
-//! `pcloud_config::{ConfigProfile, Environment}` are NOT re-exported; callers
-//! that need them must add a direct dependency on `pcloud-config`. This
-//! constraint is intentional: it prevents pcloud-sdk's semver from being
-//! implicitly coupled to private crate churn. Any future public re-export of
-//! a private-crate type must be wrapped in an SDK-owned newtype or alias, and
-//! documented here (§8:221 audit compliance).
+//! `pcloud-embedded-sdk` explicitly re-exports the types defined in `upload_session`
+//! and [`pcloud_proto::Notification`].
+//!
+//! Several workspace-internal types also appear in public method signatures:
+//!
+//! - [`pcloud_config::ConfigProfile`] appears in [`EmbeddedDaemon::config`]
+//!   and in the dispatch-level raw API.
+//! - [`pcloud_config::Environment`] appears in
+//!   [`EmbeddedDaemonBuilder::environment`].
+//! - [`pcloud_ipc::Request`] / [`pcloud_ipc::Response`] appear in
+//!   [`EmbeddedDaemon::dispatch`].
+//! - [`pcloud_plugin_api`] types appear in the plugin-registration surface.
+//! - [`pcloud_model::public_links::CreatedTreePublicLink`] appears in
+//!   [`EmbeddedDaemon::create_tree_public_link_from_paths`].
+//!
+//! These types are exposed by necessity and are part of the public contract.
+//! Callers using the raw-dispatch or plugin APIs must take direct dependencies
+//! on those crates. Any future addition of a new workspace-crate type to a
+//! public signature must be documented here (§8:221 audit compliance).
+//!
+//! Applications that only need drive operations should prefer
+//! [`EmbeddedDaemon::remote`]. Its [`RemoteDrive`] surface exposes only
+//! SDK-owned, non-exhaustive types and is the focused SemVer contract; raw
+//! IPC and backend types are deliberately kept behind that boundary.
+//!
+//! # TLS Backend
+//!
+//! The SDK currently only supports rustls with webpki-roots as the TLS
+//! backend. `pcloud-proto` hard-pins rustls; there is no `tls-native` feature
+//! at this time. Enterprise embedders that require platform-native trust
+//! stores must supply a reviewed downstream transport; no `tls-native`
+//! feature is advertised by this crate.
 //!
 //! # Examples
 //!
@@ -66,9 +93,9 @@
 //!
 //! ```no_run
 //! use std::path::PathBuf;
-//! use pcloud_sdk::EmbeddedDaemon;
+//! use pcloud_embedded_sdk::EmbeddedDaemon;
 //! use pcloud_ipc::{Method, Request, ResponseStatus};
-//! let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/pcloud-doc"))
+//! let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-doc"))
 //!     .build()
 //!     .expect("bootstrap");
 //! let resp = d.dispatch(Request::Plain { method: Method::GetHealth });
@@ -86,13 +113,15 @@
 
 use std::path::{Path, PathBuf};
 
-use pcloud_config::{ConfigProfile, Environment};
+use pcloud_config::{ConfigProfile, Environment, extensions::ExtensionPolicy};
+use pcloud_daemon::path_resolver::PathResolveError;
 use pcloud_daemon::{BootstrapError, RuntimeShell, bootstrap_with_config, dispatch};
 use pcloud_ipc::{Method, Request, Response, ResponseStatus};
 use pcloud_plugin_api::{
     Plugin, PluginAuditEvent, PluginAuditSink, PluginError, PluginOperation, PluginRegistry,
     RegisteredPlugin,
 };
+use pcloud_proto::public_links_api::PublicLinkPathResolver;
 use pcloud_secret::{ExposeSecret, secret_string::SecretString};
 use pcloud_store::{StoreProfile, append_audit_event};
 use thiserror::Error;
@@ -100,11 +129,16 @@ use thiserror::Error;
 /// Crate identifier used in audit/telemetry records.
 ///
 /// ```
-/// assert_eq!(pcloud_sdk::CRATE_NAME, "pcloud-sdk");
+/// assert_eq!(pcloud_embedded_sdk::CRATE_NAME, "pcloud-embedded-sdk");
 /// ```
-pub const CRATE_NAME: &str = "pcloud-sdk";
+pub const CRATE_NAME: &str = "pcloud-embedded-sdk";
 
+mod remote;
 mod upload_session;
+pub use remote::{
+    RemoteCopyResult, RemoteDownloadResult, RemoteDrive, RemoteDriveError, RemoteEntry,
+    RemoteEntryId, RemoteListing, RemoteRead, RemoteUploadResult,
+};
 pub use upload_session::{
     ConflictMode, DEFAULT_CHUNK_SIZE, FileMetadata, UploadConfig, UploadError, UploadHandle,
     UploadPayload, UploadProgress, UploadRequest, UploadSession, UploadSessionDriver, UploadState,
@@ -132,6 +166,7 @@ pub struct EmbeddedDaemon {
 pub struct EmbeddedDaemonBuilder {
     root: PathBuf,
     environment: Environment,
+    extensions: Option<ExtensionPolicy>,
 }
 
 /// Error surface for [`EmbeddedDaemonBuilder::build`] and for plugin
@@ -485,7 +520,7 @@ impl FilesystemPathStatus {
     /// Parity-preserving token: returns exactly the C constant name.
     ///
     /// ```
-    /// use pcloud_sdk::FilesystemPathStatus;
+    /// use pcloud_embedded_sdk::FilesystemPathStatus;
     /// assert_eq!(FilesystemPathStatus::InSync.as_c_token(), "INSYNC");
     /// assert_eq!(FilesystemPathStatus::InProgress.as_c_token(), "INPROG");
     /// assert_eq!(FilesystemPathStatus::NoSync.as_c_token(), "NOSYNC");
@@ -637,7 +672,7 @@ pub enum PublinkHelperError {
 ///
 /// Mirrors the C `ptree_public_link` path-based variant (row 149, bd-1du).
 /// The path-resolution step runs under the daemon's authenticated context,
-/// so callers do not need a separate folder-id lookup.
+/// so callers do not need separate folder/file id lookups.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum TreePublicLinkHelperError {
@@ -647,8 +682,8 @@ pub enum TreePublicLinkHelperError {
     /// Caller supplied an empty link name. User-recoverable.
     #[error("tree public link name must not be empty")]
     EmptyName,
-    /// Caller supplied an empty path list. User-recoverable — at least one
-    /// absolute pCloud-drive path is required.
+    /// Caller supplied an empty target set. User-recoverable — at least one
+    /// absolute pCloud-drive root, folder, or file path is required.
     #[error("at least one pCloud-drive path is required")]
     EmptyPaths,
     /// A path could not be resolved to a remote folder id by the daemon
@@ -768,6 +803,10 @@ pub enum AuthHelperError {
     /// code. Excessive retries may trigger a server-side cool-down.
     #[error("two-factor code submission failed: {0}")]
     TwoFactorCode(String),
+    /// Password or token login was rejected by the daemon. Wraps the
+    /// server message. Recoverability: user action — re-enter credentials.
+    #[error("login failed: {0}")]
+    Login(String),
 }
 
 /// Error surface for the signed-URL download helpers.
@@ -897,8 +936,7 @@ pub enum SdkError {
     /// Streaming [`UploadSession`] failures (cancel, pause, await_completion).
     /// Wraps [`UploadError`]. Retryability: `Canceled` is terminal —
     /// start a new session. `Helper` inherits upload retryability.
-    /// `Unimplemented` marks the cooperative-stub surface and must not be
-    /// retried; see the [`UploadSession`] docs for the state-machine matrix.
+    /// See the [`UploadSession`] docs for the state-machine matrix.
     #[error(transparent)]
     UploadSession(#[from] UploadError),
     /// Download helper failures (`get_file_link`, `download_file`).
@@ -1214,7 +1252,6 @@ impl From<upload_session::UploadError> for UnifiedError {
             upload_session::UploadError::NotStarted => err.into_unified(Category::InvalidInput),
             upload_session::UploadError::Io(_) => err.into_unified(Category::LocalIo),
             upload_session::UploadError::Helper(_) => err.into_unified(Category::Api),
-            upload_session::UploadError::Unimplemented(_) => err.into_unified(Category::Internal),
             upload_session::UploadError::InvalidState(_) => {
                 err.into_unified(Category::InvalidInput)
             }
@@ -1230,8 +1267,8 @@ impl EmbeddedDaemonBuilder {
     ///
     /// ```no_run
     /// use std::path::PathBuf;
-    /// use pcloud_sdk::EmbeddedDaemonBuilder;
-    /// let b = EmbeddedDaemonBuilder::new(PathBuf::from("/tmp/pcloud-doc"));
+    /// use pcloud_embedded_sdk::EmbeddedDaemonBuilder;
+    /// let b = EmbeddedDaemonBuilder::new(std::env::temp_dir().join("pcloud-doc"));
     /// let _daemon = b.build().expect("bootstrap");
     /// ```
     #[must_use]
@@ -1239,6 +1276,7 @@ impl EmbeddedDaemonBuilder {
         Self {
             root,
             environment: Environment::Production,
+            extensions: None,
         }
     }
 
@@ -1247,8 +1285,8 @@ impl EmbeddedDaemonBuilder {
     /// ```no_run
     /// use std::path::PathBuf;
     /// use pcloud_config::Environment;
-    /// use pcloud_sdk::EmbeddedDaemon;
-    /// let _d = EmbeddedDaemon::builder(PathBuf::from("/tmp/pcloud-doc"))
+    /// use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// let _d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-doc"))
     ///     .environment(Environment::Development)
     ///     .build()
     ///     .unwrap();
@@ -1256,6 +1294,17 @@ impl EmbeddedDaemonBuilder {
     #[must_use]
     pub fn environment(mut self, environment: Environment) -> Self {
         self.environment = environment;
+        self
+    }
+
+    /// Override the secure-default plugin policy for this embedded daemon.
+    ///
+    /// The default keeps plugins disabled. Embedders that register plugins
+    /// must opt in explicitly and grant only the capabilities their plugins
+    /// require. The policy is validated during [`Self::build`].
+    #[must_use]
+    pub fn extension_policy(mut self, policy: ExtensionPolicy) -> Self {
+        self.extensions = Some(policy);
         self
     }
 
@@ -1286,14 +1335,17 @@ impl EmbeddedDaemonBuilder {
     ///
     /// ```no_run
     /// use std::path::PathBuf;
-    /// use pcloud_sdk::EmbeddedDaemonBuilder;
-    /// let d = EmbeddedDaemonBuilder::new(PathBuf::from("/tmp/pcloud-doc"))
+    /// use pcloud_embedded_sdk::EmbeddedDaemonBuilder;
+    /// let d = EmbeddedDaemonBuilder::new(std::env::temp_dir().join("pcloud-doc"))
     ///     .build()
     ///     .expect("bootstrap");
     /// assert!(!d.runtime_summary().is_empty());
     /// ```
     pub fn build(self) -> Result<EmbeddedDaemon, SdkError> {
-        let requested_config = ConfigProfile::secure_defaults(self.root, self.environment);
+        let mut requested_config = ConfigProfile::secure_defaults(self.root, self.environment);
+        if let Some(extensions) = self.extensions {
+            requested_config.extensions = extensions;
+        }
         let runtime =
             bootstrap_with_config(requested_config).map_err(EmbeddedDaemonError::Bootstrap)?;
 
@@ -1309,8 +1361,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// use std::path::PathBuf;
-    /// use pcloud_sdk::EmbeddedDaemon;
-    /// let _builder = EmbeddedDaemon::builder(PathBuf::from("/tmp/pcloud-doc"));
+    /// use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// let _builder = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-doc"));
     /// ```
     #[must_use]
     pub fn builder(root: PathBuf) -> EmbeddedDaemonBuilder {
@@ -1321,8 +1373,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// use std::path::PathBuf;
-    /// use pcloud_sdk::EmbeddedDaemon;
-    /// let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/pcloud-doc")).build().unwrap();
+    /// use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-doc")).build().unwrap();
     /// let _ = d.runtime_summary();
     /// ```
     #[must_use]
@@ -1334,8 +1386,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// use std::path::PathBuf;
-    /// use pcloud_sdk::EmbeddedDaemon;
-    /// let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/pcloud-doc")).build().unwrap();
+    /// use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-doc")).build().unwrap();
     /// assert!(d.config().features.crypto_enabled);
     /// ```
     #[must_use]
@@ -1368,13 +1420,104 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// use std::path::PathBuf;
-    /// use pcloud_sdk::EmbeddedDaemon;
+    /// use pcloud_embedded_sdk::EmbeddedDaemon;
     /// use pcloud_ipc::{Method, Request};
-    /// let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/pcloud-doc")).build().unwrap();
+    /// let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-doc")).build().unwrap();
     /// let _resp = d.dispatch(Request::Plain { method: Method::GetHealth });
     /// ```
     pub fn dispatch(&mut self, request: Request) -> Response {
         dispatch(&mut self.runtime, request)
+    }
+
+    /// Submit a username and password credential pair to the auth state machine.
+    /// Mirrors `psync_set_user_pass` / `psync_login`.
+    ///
+    /// The password is accepted as a plain `&str` at the SDK boundary and
+    /// wrapped into a [`pcloud_ipc::RedactedString`] so it zeroizes on drop
+    /// and never appears in `Debug` output.
+    ///
+    /// Returns `Ok(())` on acceptance. When two-factor auth is required the
+    /// server returns a TFA challenge; follow up with
+    /// [`Self::submit_two_factor_code`].
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::Auth`] wrapping [`AuthHelperError::Login`] when the
+    /// server rejects the credentials.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::path::PathBuf;
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
+    /// let _ = d.login("user@example.com", "password");
+    /// ```
+    // AUDIT-NOTE: gptrev-01 M-01 — first-class login helper added so that
+    // API-REFERENCE.md entry "EmbeddedDaemon::login" compiles.
+    pub fn login(&mut self, username: &str, password: &str) -> Result<(), SdkError> {
+        let response = self.dispatch(Request::PasswordSubmission {
+            username: username.to_owned(),
+            value: password.to_owned().into(),
+        });
+        if response.status == ResponseStatus::Ok {
+            Ok(())
+        } else {
+            Err(SdkError::from(AuthHelperError::Login(response.message)))
+        }
+    }
+
+    /// Submit a pre-obtained pCloud API auth token to the auth state machine.
+    /// Mirrors `psync_set_auth`.
+    ///
+    /// The token is accepted as a plain `&str` and wrapped into a
+    /// [`pcloud_ipc::RedactedString`] so it zeroizes on drop.
+    ///
+    /// # Errors
+    ///
+    /// [`SdkError::Auth`] wrapping [`AuthHelperError::Login`] on rejection.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::path::PathBuf;
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
+    /// let _ = d.login_with_token("my-auth-token");
+    /// ```
+    // AUDIT-NOTE: gptrev-01 M-01 — first-class login_with_token helper added.
+    pub fn login_with_token(&mut self, token: &str) -> Result<(), SdkError> {
+        let response = self.dispatch(Request::AuthTokenSubmission {
+            value: token.to_owned().into(),
+        });
+        if response.status == ResponseStatus::Ok {
+            Ok(())
+        } else {
+            Err(SdkError::from(AuthHelperError::Login(response.message)))
+        }
+    }
+
+    /// Submit a TFA recovery code. Convenience wrapper over
+    /// [`Self::submit_two_factor_code`] with `recovery_code = true`.
+    ///
+    /// Mirrors the `psync_tfa_set_code` recovery-code path.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from [`Self::submit_two_factor_code`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::path::PathBuf;
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
+    /// let _ = d.submit_recovery_code("recovery-phrase-here", false);
+    /// ```
+    // AUDIT-NOTE: gptrev-01 M-01 — submit_recovery_code added so
+    // API-REFERENCE.md entry compiles. Delegates to submit_two_factor_code.
+    pub fn submit_recovery_code(&mut self, code: &str, trust_device: bool) -> Result<(), SdkError> {
+        self.submit_two_factor_code(code, trust_device, true)
     }
 
     /// Register a plugin against the embedded daemon's plugin registry.
@@ -1439,8 +1582,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// use std::path::PathBuf;
-    /// use pcloud_sdk::EmbeddedDaemon;
-    /// let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/pcloud-doc")).build().unwrap();
+    /// use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-doc")).build().unwrap();
     /// assert!(d.loaded_plugins().is_empty());
     /// ```
     #[must_use]
@@ -1452,15 +1595,14 @@ impl EmbeddedDaemon {
     ///
     /// The handle exposes a progress watch channel plus pause/resume/
     /// cancel/await-completion controls. See [`UploadSession`] for the
-    /// full contract, cooperative-stub matrix tracked under `bd-1du.10`,
-    /// and `TODO(stub)` markers.
+    /// full contract and the row 94 limitation: this legacy public helper
+    /// still uses the synchronous single-shot upload path.
     ///
     /// # Preconditions
     ///
     /// An authenticated session must be present. The caller retains
-    /// ownership of the [`UploadRequest`] payload; on the stub path the
-    /// entire payload is read and uploaded synchronously *before* this
-    /// method returns (see cooperative-stub matrix).
+    /// ownership of the [`UploadRequest`] payload; the entire payload is
+    /// read and uploaded synchronously *before* this method returns.
     ///
     /// # Errors
     ///
@@ -1511,8 +1653,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _res = d.upload_data(22, "report.txt", b"hello");
     /// ```
     pub fn upload_data(
@@ -1552,8 +1694,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::{Path, PathBuf};
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _res = d.upload_file(22, "report.txt", Path::new("/etc/hostname"));
     /// ```
     pub fn upload_file(
@@ -1566,13 +1708,53 @@ impl EmbeddedDaemon {
         self.upload_data(folder_id, remote_filename, &bytes)
     }
 
+    /// Copy bytes from an existing remote pCloud file into an open upload
+    /// session using the `upload_writefromfile` server-side-copy primitive.
+    ///
+    /// `upload_offset` maps to the C `uploadoffset` parameter and
+    /// `source_offset` maps to the C `offset` parameter. They are separate
+    /// on purpose: resumed or spliced copies do not always read and write at
+    /// the same byte offset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UploadHelperError::NotAuthenticated`] when no session is
+    /// active, or [`UploadHelperError::Write`] when the daemon/backend rejects
+    /// the server-side-copy request.
+    pub fn upload_write_from_file(
+        &mut self,
+        upload_session_id: u64,
+        source_fileid: u64,
+        source_hash: u64,
+        upload_offset: u64,
+        source_offset: u64,
+        count: u64,
+    ) -> Result<(), SdkError> {
+        if self.runtime.auth.snapshot().auth_token.is_none() {
+            return Err(SdkError::from(UploadHelperError::NotAuthenticated));
+        }
+        let response = self.dispatch(Request::UploadWriteFromFile {
+            upload_session_id,
+            source_fileid,
+            source_hash,
+            offset: upload_offset,
+            source_offset: Some(source_offset),
+            count,
+        });
+        if response.status == ResponseStatus::Ok {
+            Ok(())
+        } else {
+            Err(SdkError::from(UploadHelperError::Write(response.message)))
+        }
+    }
+
     /// Upload `data` by absolute remote path, resolving `remote_path` to
     /// its folder id first.
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _res = d.upload_data_as("/Documents", "report.txt", b"hello");
     /// ```
     pub fn upload_data_as(
@@ -1594,8 +1776,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::{Path, PathBuf};
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _res = d.upload_file_as("/Documents", "x.txt", Path::new("/etc/hostname"));
     /// ```
     pub fn upload_file_as(
@@ -1615,8 +1797,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _res = d.create_remote_folder(0, "project");
     /// ```
     pub fn create_remote_folder(
@@ -1649,8 +1831,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _res = d.create_remote_folder_by_path("/Documents/new");
     /// ```
     pub fn create_remote_folder_by_path(
@@ -1686,8 +1868,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _res = d.check_and_create_folder(0, "inbox");
     /// ```
     pub fn check_and_create_folder(
@@ -1728,8 +1910,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _list = d.get_api_servers();
     /// ```
     pub fn get_api_servers(&self) -> Result<Vec<ApiServerResult>, SdkError> {
@@ -1754,8 +1936,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _p = d.get_promo();
     /// ```
     pub fn get_promo(&self) -> Result<Option<PromoResult>, SdkError> {
@@ -1784,8 +1966,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.set_language("en");
     /// ```
     pub fn set_language(&self, language: &str) -> Result<(), SdkError> {
@@ -1807,8 +1989,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.verify_email();
     /// ```
     pub fn verify_email(&self) -> Result<(), SdkError> {
@@ -1830,8 +2012,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.verify_email_restricted("tok");
     /// ```
     pub fn verify_email_restricted(&self, verify_token: &str) -> Result<(), SdkError> {
@@ -1847,8 +2029,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.lost_password("user@example.com");
     /// ```
     pub fn lost_password(&self, email: &str) -> Result<(), SdkError> {
@@ -1862,8 +2044,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.change_password("old", "new-strong-passphrase");
     /// ```
     pub fn change_password(
@@ -1891,9 +2073,9 @@ impl EmbeddedDaemon {
             .map_err(|err| AccountUtilityError::ChangePassword(err.to_string()))?;
         self.runtime
             .auth
-            .replace_auth_token(pcloud_secret::secret_string::SecretString::new(
-                result.auth_token,
-            ))
+            // CLAUDEREV iter-1 SEC-H fix: result.auth_token already is
+            // SecretString from pcloud-proto::account_api.
+            .replace_auth_token(result.auth_token)
             .map_err(|err| SdkError::from(AccountUtilityError::ChangePassword(err.to_string())))
     }
 
@@ -1906,9 +2088,9 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
     /// # use pcloud_secret::secret_string::SecretString;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.register("user@example.com", SecretString::new("pw"), true);
     /// ```
     pub fn register(
@@ -1941,14 +2123,22 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.set_api_server("binapi.pcloud.com", 1);
     /// ```
     pub fn set_api_server(&mut self, binapi: &str, location_id: u32) -> Result<(), SdkError> {
-        self.runtime
-            .set_api_server(binapi, location_id)
-            .map_err(|err| SdkError::from(AccountUtilityError::SetApiServer(err.to_string())))
+        let response = self.dispatch(Request::SetApiServer {
+            location_id,
+            binapi: binapi.to_owned(),
+        });
+        if response.status == ResponseStatus::Ok {
+            Ok(())
+        } else {
+            Err(SdkError::from(AccountUtilityError::SetApiServer(
+                response.message,
+            )))
+        }
     }
 
     /// Current crypto private-key flags. Mirrors the legacy
@@ -1957,8 +2147,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// assert_eq!(d.crypto_priv_key_flags(), 0);
     /// ```
     #[must_use]
@@ -1973,8 +2163,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.crypto_send_change_user_private();
     /// ```
     pub fn crypto_send_change_user_private(&self) -> Result<(), SdkError> {
@@ -2031,9 +2221,9 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
     /// # use pcloud_secret::secret_string::SecretString;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.crypto_change_password(
     ///     SecretString::new("old"),
     ///     SecretString::new("new"),
@@ -2087,9 +2277,9 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
     /// # use pcloud_secret::secret_string::SecretString;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.crypto_change_password_unlocked(
     ///     SecretString::new("new"), "hint", "code", 0
     /// );
@@ -2168,8 +2358,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.create_backup("Documents", None);
     /// ```
     pub fn create_backup(
@@ -2213,8 +2403,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.delete_backup(42);
     /// ```
     pub fn delete_backup(&mut self, folder_id: u64) -> Result<(), SdkError> {
@@ -2239,8 +2429,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.stop_device(None);
     /// ```
     pub fn stop_device(&mut self, device_folder_id: Option<u64>) -> Result<(), SdkError> {
@@ -2275,8 +2465,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.delete_backup_device();
     /// ```
     pub fn delete_backup_device(&mut self) -> Result<(), SdkError> {
@@ -2295,8 +2485,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.set_backup_device_folder_id(1234);
     /// ```
     pub fn set_backup_device_folder_id(&mut self, folder_id: u64) -> Result<(), SdkError> {
@@ -2316,8 +2506,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.list_notifications();
     /// ```
     pub fn list_notifications(&mut self) -> Result<Vec<Notification>, SdkError> {
@@ -2342,8 +2532,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.mark_notifications_read(42);
     /// ```
     pub fn mark_notifications_read(&mut self, upto_id: u64) -> Result<(), SdkError> {
@@ -2373,8 +2563,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _wake = d.run_localscan();
     /// ```
     pub fn run_localscan(&mut self) -> u64 {
@@ -2409,8 +2599,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.send_publink("ABC123", "a@x.com,b@x.com", "Check this out");
     /// ```
     pub fn send_publink(
@@ -2441,10 +2631,11 @@ impl EmbeddedDaemon {
             .map_err(|err| SdkError::from(PublinkHelperError::Send(err.to_string())))
     }
 
-    /// Create a tree public link by resolving one or more absolute pCloud-drive
-    /// paths to remote folder ids under the daemon's authenticated context, then
-    /// invoking `ptree_public_link`. Mirrors the C path-based variant of
-    /// `psync_create_uploadlink` / `ptree_public_link` (row 149, bd-1du).
+    /// Create a tree public link by resolving one or more absolute
+    /// pCloud-drive folder or file paths under the daemon's authenticated
+    /// context, then invoking `ptree_public_link`. Mirrors the C path-based
+    /// variant of `psync_create_uploadlink` / `ptree_public_link`
+    /// (row 149, bd-1du).
     ///
     /// Returns a [`pcloud_model::public_links::CreatedTreePublicLink`] on
     /// success.
@@ -2456,7 +2647,7 @@ impl EmbeddedDaemon {
     /// - [`TreePublicLinkHelperError::EmptyName`] — blank link name.
     /// - [`TreePublicLinkHelperError::EmptyPaths`] — no paths supplied.
     /// - [`TreePublicLinkHelperError::PathResolution`] — one or more paths
-    ///   could not be resolved to a remote folder id.
+    ///   could not be resolved to either a remote folder id or file id.
     /// - [`TreePublicLinkHelperError::Api`] — server rejected the tree-link
     ///   creation. Transiently retryable with backoff.
     ///
@@ -2470,8 +2661,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let result = d.create_tree_public_link_from_paths(
     ///     "My shared bundle",
     ///     vec!["/Documents/report.pdf".to_owned(), "/Photos/album".to_owned()],
@@ -2499,13 +2690,88 @@ impl EmbeddedDaemon {
             .as_ref()
             .map(SecretString::clone_secret)
             .ok_or(TreePublicLinkHelperError::NotAuthenticated)?;
-        // Build a TreePublicLinkPaths treating every caller path as a folder
-        // path. The daemon-side path resolver will resolve each to a remote
-        // folder id before the tree-link create call.
+        let resolver = self
+            .runtime
+            .public_link_runtime
+            .path_resolver(auth_token.clone_secret());
+        let mut folders = Vec::new();
+        let mut files = Vec::new();
+        for path in paths {
+            match resolver.resolve_folder(&path) {
+                Ok(_) => folders.push(path),
+                Err(PathResolveError::ExpectedFolder { .. }) => {
+                    resolver.resolve_file(&path).map_err(|err| {
+                        TreePublicLinkHelperError::PathResolution(err.to_string())
+                    })?;
+                    files.push(path);
+                }
+                Err(err) => {
+                    return Err(SdkError::from(TreePublicLinkHelperError::PathResolution(
+                        err.to_string(),
+                    )));
+                }
+            }
+        }
         let link_paths = pcloud_proto::public_links_api::TreePublicLinkPaths {
             root: None,
-            folders: paths,
-            files: vec![],
+            folders,
+            files,
+        };
+        self.runtime
+            .public_link_runtime
+            .create_tree_public_link_from_paths(
+                auth_token,
+                name,
+                &link_paths,
+                &resolver,
+                expires,
+                None,
+                None,
+            )
+            .map_err(|err| SdkError::from(TreePublicLinkHelperError::Api(err.to_string())))
+    }
+
+    /// Create a tree public link from the explicit C target shape: optional
+    /// root folder path, zero or more folder paths, and zero or more file
+    /// paths.
+    ///
+    /// This is the SDK route to the full row 149 path surface when callers
+    /// need a root target instead of a flat mixed path list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TreePublicLinkHelperError::EmptyName`] for a blank link
+    /// name, [`TreePublicLinkHelperError::EmptyPaths`] when all target sets
+    /// are empty, [`TreePublicLinkHelperError::NotAuthenticated`] without an
+    /// active session, and [`TreePublicLinkHelperError::Api`] for resolver or
+    /// server rejection.
+    pub fn create_tree_public_link_from_targets(
+        &mut self,
+        name: impl Into<String>,
+        root: Option<String>,
+        folders: Vec<String>,
+        files: Vec<String>,
+        expires: Option<u64>,
+    ) -> Result<pcloud_model::public_links::CreatedTreePublicLink, SdkError> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(SdkError::from(TreePublicLinkHelperError::EmptyName));
+        }
+        if root.is_none() && folders.is_empty() && files.is_empty() {
+            return Err(SdkError::from(TreePublicLinkHelperError::EmptyPaths));
+        }
+        let auth_token = self
+            .runtime
+            .auth
+            .snapshot()
+            .auth_token
+            .as_ref()
+            .map(SecretString::clone_secret)
+            .ok_or(TreePublicLinkHelperError::NotAuthenticated)?;
+        let link_paths = pcloud_proto::public_links_api::TreePublicLinkPaths {
+            root,
+            folders,
+            files,
         };
         self.runtime
             .public_link_runtime
@@ -2528,8 +2794,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.get_folder_id_by_path("/Documents");
     /// ```
     pub fn get_folder_id_by_path(&mut self, path: impl Into<String>) -> Result<u64, SdkError> {
@@ -2562,8 +2828,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.get_folder_flags("/Documents");
     /// ```
     pub fn get_folder_flags(
@@ -2602,8 +2868,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.get_folder_owner_id("/Documents");
     /// ```
     pub fn get_folder_owner_id(&mut self, path: impl Into<String>) -> Result<u64, SdkError> {
@@ -2639,8 +2905,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::{EmbeddedDaemon, FilesystemPathStatus};
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::{EmbeddedDaemon, FilesystemPathStatus};
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// assert_eq!(d.filesystem_status("/does/not/exist"), FilesystemPathStatus::Invalid);
     /// ```
     #[must_use]
@@ -2707,8 +2973,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// assert!(d.backup_device_folder_id().is_none());
     /// ```
     #[must_use]
@@ -2726,8 +2992,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _v = d.get_uint_value("usedquota");
     /// ```
     pub fn get_uint_value(&self, name: &str) -> Result<u64, SdkError> {
@@ -2739,8 +3005,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _v = d.get_int_value("last_offset");
     /// ```
     pub fn get_int_value(&self, name: &str) -> Result<i64, SdkError> {
@@ -2752,8 +3018,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _v = d.get_bool_value("crypto_setup");
     /// ```
     pub fn get_bool_value(&self, name: &str) -> Result<bool, SdkError> {
@@ -2768,8 +3034,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _v = d.get_string_value("user_email");
     /// ```
     pub fn get_string_value(&self, name: &str) -> Result<Option<String>, SdkError> {
@@ -2781,8 +3047,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// d.set_uint_value("last_seen", 42).unwrap();
     /// ```
     pub fn set_uint_value(&self, name: &str, value: u64) -> Result<(), SdkError> {
@@ -2794,8 +3060,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// d.set_int_value("delta", -1).unwrap();
     /// ```
     pub fn set_int_value(&self, name: &str, value: i64) -> Result<(), SdkError> {
@@ -2807,8 +3073,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// d.set_bool_value("welcome_seen", true).unwrap();
     /// ```
     pub fn set_bool_value(&self, name: &str, value: bool) -> Result<(), SdkError> {
@@ -2820,8 +3086,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// d.set_string_value("hint", "hello").unwrap();
     /// ```
     pub fn set_string_value(&self, name: &str, value: &str) -> Result<(), SdkError> {
@@ -2834,8 +3100,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// assert!(!d.has_uint_value("nope").unwrap());
     /// ```
     pub fn has_uint_value(&self, name: &str) -> Result<bool, SdkError> {
@@ -2847,8 +3113,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.has_int_value("nope");
     /// ```
     pub fn has_int_value(&self, name: &str) -> Result<bool, SdkError> {
@@ -2860,8 +3126,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.has_bool_value("nope");
     /// ```
     pub fn has_bool_value(&self, name: &str) -> Result<bool, SdkError> {
@@ -2873,8 +3139,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.has_string_value("nope");
     /// ```
     pub fn has_string_value(&self, name: &str) -> Result<bool, SdkError> {
@@ -2889,8 +3155,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// assert!(!d.is_authenticated());
     /// ```
     #[must_use]
@@ -2903,8 +3169,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// assert!(d.current_user_id().is_none());
     /// ```
     #[must_use]
@@ -2922,8 +3188,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// assert!(d.username().is_none());
     /// ```
     #[must_use]
@@ -2954,8 +3220,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.userinfo();
     /// ```
     pub fn userinfo(&self) -> Result<AuthenticatedUser, SdkError> {
@@ -2984,8 +3250,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.logout();
     /// ```
     pub fn logout(&mut self) -> Result<(), SdkError> {
@@ -3005,8 +3271,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.send_two_factor_sms();
     /// ```
     pub fn send_two_factor_sms(&self) -> Result<TwoFactorSmsInfo, SdkError> {
@@ -3026,8 +3292,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.send_two_factor_notification();
     /// ```
     pub fn send_two_factor_notification(&self) -> Result<TwoFactorNotificationInfo, SdkError> {
@@ -3053,8 +3319,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.submit_two_factor_code("123456", true, false);
     /// ```
     pub fn submit_two_factor_code(
@@ -3080,8 +3346,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.get_file_link(42, None);
     /// ```
     pub fn get_file_link(
@@ -3138,8 +3404,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _bytes = d.download_file(42);
     /// ```
     pub fn download_file(&self, file_id: u64) -> Result<Vec<u8>, SdkError> {
@@ -3171,8 +3437,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// assert!(d.auth_token_secret().is_none());
     /// ```
     pub fn auth_token_secret(&self) -> Option<SecretString> {
@@ -3192,8 +3458,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// assert_eq!(d.get_bool_setting("unset").unwrap(), None);
     /// ```
     pub fn get_bool_setting(&self, name: &str) -> Result<Option<bool>, SdkError> {
@@ -3205,8 +3471,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// d.set_bool_setting("autostart", true).unwrap();
     /// ```
     pub fn set_bool_setting(&self, name: &str, value: bool) -> Result<(), SdkError> {
@@ -3218,8 +3484,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// assert_eq!(d.get_int_setting("unset").unwrap(), None);
     /// ```
     pub fn get_int_setting(&self, name: &str) -> Result<Option<i64>, SdkError> {
@@ -3231,8 +3497,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// d.set_int_setting("scan_interval", 30).unwrap();
     /// ```
     pub fn set_int_setting(&self, name: &str, value: i64) -> Result<(), SdkError> {
@@ -3244,8 +3510,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// assert_eq!(d.get_uint_setting("unset").unwrap(), None);
     /// ```
     pub fn get_uint_setting(&self, name: &str) -> Result<Option<u64>, SdkError> {
@@ -3257,8 +3523,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// d.set_uint_setting("rate_limit", 100).unwrap();
     /// ```
     pub fn set_uint_setting(&self, name: &str, value: u64) -> Result<(), SdkError> {
@@ -3273,8 +3539,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// assert_eq!(d.get_string_setting("unset").unwrap(), None);
     /// ```
     pub fn get_string_setting(&self, name: &str) -> Result<Option<String>, SdkError> {
@@ -3286,8 +3552,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// d.set_string_setting("theme", "dark").unwrap();
     /// ```
     pub fn set_string_setting(&self, name: &str, value: &str) -> Result<(), SdkError> {
@@ -3300,8 +3566,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let _ = d.reset_setting("theme");
     /// ```
     pub fn reset_setting(&self, name: &str) -> Result<bool, SdkError> {
@@ -3315,98 +3581,28 @@ impl EmbeddedDaemon {
     /// `pentry_t*`; the Rust surface returns a typed [`StatResult`] or a
     /// structured error.
     ///
-    /// For root `/` the server returns the root folder metadata directly.
-    /// For non-root paths the helper lists the parent folder and locates
-    /// the named child entry.
+    /// Resolution is delegated to the canonical live remote-drive service;
+    /// an empty local metadata cache does not change the result.
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let info = d.stat_path("/Documents").unwrap();
     /// assert!(info.is_folder);
     /// ```
     pub fn stat_path(&mut self, path: &str) -> Result<StatResult, SdkError> {
-        if path.trim().is_empty() || !path.starts_with('/') {
-            return Err(SdkError::from(FolderMetadataError::InvalidPath));
-        }
-        let auth_token = self
-            .runtime
-            .auth
-            .snapshot()
-            .auth_token
-            .as_ref()
-            .map(SecretString::clone_secret)
-            .ok_or(FolderMetadataError::NotAuthenticated)?;
-
-        // For root, list "/" and return the folder itself.
-        if path == "/" {
-            let listing = self
-                .runtime
-                .folder_runtime
-                .list_folder_contents(auth_token, "/")
-                .map_err(|err| FolderMetadataError::Resolve(err.to_string()))?;
-            return Ok(StatResult {
-                name: listing.name,
-                is_folder: true,
-                folder_id: Some(listing.folder_id),
-                file_id: None,
-                size: None,
-                modified: None,
-                is_mine: listing.is_mine,
-                encrypted: listing.encrypted,
-                is_shared: listing.is_shared,
-                permissions: listing.permissions,
-            });
-        }
-
-        // For non-root: list the parent and find the child entry.
-        let parent = if let Some(pos) = path.rfind('/') {
-            if pos == 0 { "/" } else { &path[..pos] }
-        } else {
-            "/"
-        };
-        let child_name = path.rsplit('/').next().unwrap_or("");
-        if child_name.is_empty() {
-            // Trailing slash — treat as the folder itself.
-            let listing = self
-                .runtime
-                .folder_runtime
-                .list_folder_contents(auth_token, path.trim_end_matches('/'))
-                .map_err(|err| FolderMetadataError::Resolve(err.to_string()))?;
-            return Ok(StatResult {
-                name: listing.name,
-                is_folder: true,
-                folder_id: Some(listing.folder_id),
-                file_id: None,
-                size: None,
-                modified: None,
-                is_mine: listing.is_mine,
-                encrypted: listing.encrypted,
-                is_shared: listing.is_shared,
-                permissions: listing.permissions,
-            });
-        }
-
-        let listing = self
-            .runtime
-            .folder_runtime
-            .list_folder_contents(auth_token, parent)
-            .map_err(|err| FolderMetadataError::Resolve(err.to_string()))?;
-
-        let entry = listing
-            .entries
-            .iter()
-            .find(|e| e.name == child_name)
-            .ok_or_else(|| {
-                FolderMetadataError::Resolve(format!("entry not found: {child_name}"))
-            })?;
-
+        let entry = self.remote().stat(path).map_err(|error| match error {
+            RemoteDriveError::InvalidRequest(_) => FolderMetadataError::InvalidPath,
+            RemoteDriveError::Unauthorized(_) => FolderMetadataError::NotAuthenticated,
+            other => FolderMetadataError::Resolve(other.to_string()),
+        })?;
+        let is_folder = entry.id.is_folder();
         Ok(StatResult {
-            name: entry.name.clone(),
-            is_folder: entry.is_folder,
-            folder_id: entry.folder_id,
-            file_id: entry.file_id,
+            name: entry.name,
+            is_folder,
+            folder_id: is_folder.then_some(entry.id.value()),
+            file_id: (!is_folder).then_some(entry.id.value()),
             size: entry.size,
             modified: entry.modified,
             is_mine: entry.is_mine,
@@ -3423,40 +3619,27 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let entries = d.list_folder("/").unwrap();
     /// for entry in &entries {
     ///     println!("{} (folder={})", entry.name, entry.is_folder);
     /// }
     /// ```
     pub fn list_folder(&mut self, path: &str) -> Result<Vec<FolderEntry>, SdkError> {
-        if path.trim().is_empty() || !path.starts_with('/') {
-            return Err(SdkError::from(FolderMetadataError::InvalidPath));
-        }
-        let auth_token = self
-            .runtime
-            .auth
-            .snapshot()
-            .auth_token
-            .as_ref()
-            .map(SecretString::clone_secret)
-            .ok_or(FolderMetadataError::NotAuthenticated)?;
-
-        let listing = self
-            .runtime
-            .folder_runtime
-            .list_folder_contents(auth_token, path)
-            .map_err(|err| FolderMetadataError::Resolve(err.to_string()))?;
-
+        let listing = self.remote().list(path).map_err(|error| match error {
+            RemoteDriveError::InvalidRequest(_) => FolderMetadataError::InvalidPath,
+            RemoteDriveError::Unauthorized(_) => FolderMetadataError::NotAuthenticated,
+            other => FolderMetadataError::Resolve(other.to_string()),
+        })?;
         Ok(listing
             .entries
             .into_iter()
             .map(|e| FolderEntry {
                 name: e.name,
-                is_folder: e.is_folder,
-                folder_id: e.folder_id,
-                file_id: e.file_id,
+                is_folder: e.id.is_folder(),
+                folder_id: e.id.is_folder().then_some(e.id.value()),
+                file_id: (!e.id.is_folder()).then_some(e.id.value()),
                 size: e.size,
                 modified: e.modified,
                 is_mine: e.is_mine,
@@ -3474,22 +3657,29 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// d.delete_file("/Documents/old.txt").unwrap();
     /// ```
-    pub fn delete_file(&mut self, _path: &str) -> Result<(), SdkError> {
+    pub fn delete_file(&mut self, path: &str) -> Result<(), SdkError> {
         if self.runtime.auth.snapshot().auth_token.is_none() {
             return Err(SdkError::from(FileMutationHelperError::NotAuthenticated));
         }
-        // TODO(bd-1du.10): wire to correct IPC variant (DeleteFile) once that Request
-        // variant exists in pcloud-ipc::methods::Request. `_path` is held
-        // unused until that wiring lands — the guard above preserves the
-        // error surface shape (NotAuthenticated vs DeleteFailed) so callers
-        // can rely on it even while the IPC variant is stubbed.
-        Err(SdkError::from(FileMutationHelperError::DeleteFailed(
-            "delete_file IPC variant not yet implemented (bd-1du.10)".to_owned(),
-        )))
+        if path.trim().is_empty() || !path.starts_with('/') {
+            return Err(SdkError::from(FileMutationHelperError::DeleteFailed(
+                "delete_file requires an absolute path starting with '/'".to_owned(),
+            )));
+        }
+        let response = self.dispatch(Request::FileDeleteByPath {
+            path: path.to_owned(),
+        });
+        if response.status == ResponseStatus::Ok {
+            Ok(())
+        } else {
+            Err(SdkError::from(FileMutationHelperError::DeleteFailed(
+                response.message,
+            )))
+        }
     }
 
     /// Rename (move) a remote file from `src_path` to `dst_path`.
@@ -3499,21 +3689,35 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// d.rename_file("/Documents/old.txt", "/Documents/new.txt").unwrap();
     /// ```
     pub fn rename_file(&mut self, src_path: &str, dst_path: &str) -> Result<(), SdkError> {
-        let _ = (src_path, dst_path);
         if self.runtime.auth.snapshot().auth_token.is_none() {
             return Err(SdkError::from(FileMutationHelperError::NotAuthenticated));
         }
-        // TODO(bd-1du.10): wire to correct IPC variant (RenameFile / MoveFile) once that
-        // Request variant exists in pcloud-ipc::methods::Request. Tracked
-        // under bd-1du.10.
-        Err(SdkError::from(FileMutationHelperError::RenameFailed(
-            "rename_file IPC variant not yet implemented (bd-1du.10)".to_owned(),
-        )))
+        if src_path.trim().is_empty() || !src_path.starts_with('/') {
+            return Err(SdkError::from(FileMutationHelperError::RenameFailed(
+                "rename_file: src_path must be an absolute path starting with '/'".to_owned(),
+            )));
+        }
+        if dst_path.trim().is_empty() || !dst_path.starts_with('/') {
+            return Err(SdkError::from(FileMutationHelperError::RenameFailed(
+                "rename_file: dst_path must be an absolute path starting with '/'".to_owned(),
+            )));
+        }
+        let response = self.dispatch(Request::RenamePath {
+            from: src_path.to_owned(),
+            to: dst_path.to_owned(),
+        });
+        if response.status == ResponseStatus::Ok {
+            Ok(())
+        } else {
+            Err(SdkError::from(FileMutationHelperError::RenameFailed(
+                response.message,
+            )))
+        }
     }
 
     /// Stat a remote file by absolute pCloud-drive path. Returns the
@@ -3524,8 +3728,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// let info = d.get_file_info("/Documents/report.txt").unwrap();
     /// ```
     pub fn get_file_info(&mut self, path: &str) -> Result<StatResult, SdkError> {
@@ -3551,8 +3755,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// d.mount(std::path::Path::new("/mnt/pcloud")).unwrap();
     /// ```
     pub fn mount(&mut self, mountpoint: &Path) -> Result<(), SdkError> {
@@ -3572,8 +3776,8 @@ impl EmbeddedDaemon {
     ///
     /// ```no_run
     /// # use std::path::PathBuf;
-    /// # use pcloud_sdk::EmbeddedDaemon;
-    /// # let mut d = EmbeddedDaemon::builder(PathBuf::from("/tmp/x")).build().unwrap();
+    /// # use pcloud_embedded_sdk::EmbeddedDaemon;
+    /// # let mut d = EmbeddedDaemon::builder(std::env::temp_dir().join("pcloud-sdk-doctest")).build().unwrap();
     /// d.unmount().unwrap();
     /// ```
     pub fn unmount(&mut self) -> Result<(), SdkError> {
@@ -3656,6 +3860,19 @@ mod tests {
             .expect_err("default extension policy should deny plugins");
 
         assert!(err.to_string().contains("disabled"));
+
+        let root = unique_test_root("plugin-enabled");
+        let mut policy =
+            pcloud_config::extensions::ExtensionPolicy::secure_defaults(root.join("plugins"));
+        policy.plugins_enabled = true;
+        let mut daemon = EmbeddedDaemon::builder(root)
+            .extension_policy(policy)
+            .build()
+            .expect("enabled embedded daemon should bootstrap");
+        let loaded = daemon
+            .register_plugin(&mut plugin)
+            .expect("observe plugin should load with an explicit policy");
+        assert_eq!(loaded.manifest.id, "observe");
     }
 
     #[test]
@@ -3697,6 +3914,24 @@ mod tests {
         assert_eq!(result.parent_folder_id, 22);
         assert_eq!(result.remote_filename, "report.txt");
         assert_eq!(result.bytes_uploaded, 11);
+    }
+
+    #[test]
+    fn upload_write_from_file_requires_authentication() {
+        let root = unique_test_root("upload-writefromfile-noauth");
+        let mut daemon = EmbeddedDaemon::builder(root)
+            .environment(pcloud_config::Environment::Development)
+            .build()
+            .expect("embedded daemon should bootstrap");
+
+        let err = daemon
+            .upload_write_from_file(77, 20, 1234, 4096, 128, 1024)
+            .expect_err("server-side copy should require auth");
+
+        assert!(matches!(
+            err,
+            super::SdkError::Upload(super::UploadHelperError::NotAuthenticated)
+        ));
     }
 
     #[test]
@@ -4309,6 +4544,7 @@ mod tests {
                 remote_path: "/".to_owned(),
                 paused: false,
                 sync_type: pcloud_model::sync::SyncType::Full,
+                exclude_globs: Vec::new(),
             });
 
         assert_eq!(
@@ -4401,6 +4637,52 @@ mod tests {
         assert_eq!(stat.name, "notes.txt");
         assert_eq!(stat.file_id, Some(20));
         assert_eq!(stat.size, Some(1024));
+    }
+
+    #[test]
+    fn tree_public_link_from_paths_requires_authentication() {
+        let root = unique_test_root("tree-link-noauth");
+        let mut daemon = EmbeddedDaemon::builder(root)
+            .environment(pcloud_config::Environment::Development)
+            .build()
+            .expect("embedded daemon should bootstrap");
+
+        let err = daemon
+            .create_tree_public_link_from_paths(
+                "mixed bundle",
+                vec!["/Documents".to_owned(), "/notes.txt".to_owned()],
+                None,
+            )
+            .expect_err("tree link should require auth");
+
+        assert!(matches!(
+            err,
+            super::SdkError::TreePublicLink(super::TreePublicLinkHelperError::NotAuthenticated)
+        ));
+    }
+
+    #[test]
+    fn tree_public_link_from_targets_rejects_empty_targets() {
+        let root = unique_test_root("tree-link-empty-targets");
+        let mut daemon = EmbeddedDaemon::builder(root)
+            .environment(pcloud_config::Environment::Development)
+            .build()
+            .expect("embedded daemon should bootstrap");
+
+        let err = daemon
+            .create_tree_public_link_from_targets(
+                "target bundle",
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .expect_err("empty tree targets should fail before auth");
+
+        assert!(matches!(
+            err,
+            super::SdkError::TreePublicLink(super::TreePublicLinkHelperError::EmptyPaths)
+        ));
     }
 
     #[test]
